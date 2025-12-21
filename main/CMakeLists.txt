@@ -4,6 +4,7 @@ idf_component_register(
         "sdcard.c"
         "cli.c"
         "led_status.c"
+        "msc.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -11,4 +12,5 @@ idf_component_register(
         driver
         esp_timer
         led_strip
+        esp_tinyusb
 )

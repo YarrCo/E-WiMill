@@ -24,9 +24,8 @@
 #include "wimill_pins.h"
 
 #define TAG "SDCARD"
-#define DEFAULT_MAX_FILES 10
 #define DEFAULT_ALLOC_UNIT (32 * 1024)
-#define SDTEST_FILE_PATH WIMILL_SD_MOUNT_POINT "/.wimill_sdtest.bin"
+#define SDTEST_FILE_PATH "/sdcard/.wimill_sdtest.bin"
 #define SDTEST_BLOCK_MIN 4096
 
 static sdmmc_card_t *s_card = NULL;
@@ -57,187 +56,164 @@ static bool ensure_mutex(void)
     return true;
 }
 
-static bool sd_lock(void)
+void sdcard_lock(void)
 {
     if (!ensure_mutex()) {
-        return false;
+        return;
     }
-    if (xSemaphoreTakeRecursive(s_fs_mutex, pdMS_TO_TICKS(30000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to lock SD mutex");
-        return false;
-    }
-    return true;
+    xSemaphoreTakeRecursive(s_fs_mutex, pdMS_TO_TICKS(30000));
 }
 
-static void sd_unlock(void)
+void sdcard_unlock(void)
 {
     if (s_fs_mutex) {
         xSemaphoreGiveRecursive(s_fs_mutex);
     }
 }
 
-static void log_mount_hint(esp_err_t err)
+esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
 {
-    ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(err));
-    ESP_LOGW(TAG, "Check wiring (3.3V, CS/SCK/MOSI/MISO), card formatted FAT32, and try again.");
+    if (!out_card) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    sdcard_lock();
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = s_host_id;
+    host.max_freq_khz = s_current_freq_khz;
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = WIMILL_PIN_SD_MOSI,
+        .miso_io_num = WIMILL_PIN_SD_MISO,
+        .sclk_io_num = WIMILL_PIN_SD_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+
+    gpio_set_pull_mode(WIMILL_PIN_SD_MOSI, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(WIMILL_PIN_SD_MISO, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(WIMILL_PIN_SD_SCK, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(WIMILL_PIN_SD_CS, GPIO_PULLUP_ONLY);
+
+    esp_err_t ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(ret));
+        sdcard_unlock();
+        return ret;
+    }
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = WIMILL_PIN_SD_CS;
+    slot_config.host_id = host.slot;
+
+    sdspi_dev_handle_t dev_handle = NULL;
+    ret = sdspi_host_init_device(&slot_config, &dev_handle);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "sdspi_host_init_device failed: %s", esp_err_to_name(ret));
+        sdcard_unlock();
+        return ret;
+    }
+
+    sdmmc_card_t *card = calloc(1, sizeof(sdmmc_card_t));
+    if (!card) {
+        sdcard_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    ret = sdmmc_card_init(&host, card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "sdmmc_card_init failed: %s", esp_err_to_name(ret));
+        free(card);
+        sdcard_unlock();
+        return ret;
+    }
+
+    s_card = card;
+    *out_card = card;
+
+    char name[8] = {0};
+    memcpy(name, s_card->cid.name, sizeof(s_card->cid.name));
+    const double size_mb = ((double)s_card->csd.capacity) * s_card->csd.sector_size / (1024.0 * 1024.0);
+    ESP_LOGI(TAG, "SD raw init OK: %s size=%.2f MB freq=%u kHz", name, size_mb, s_current_freq_khz);
+
+    sdcard_unlock();
+    return ESP_OK;
+}
+
+uint32_t sdcard_get_current_freq_khz(void) { return s_current_freq_khz; }
+uint32_t sdcard_get_default_freq_khz(void) { return WIMILL_SD_FREQ_KHZ_DEFAULT; }
+
+esp_err_t sdcard_mount(void)
+{
+    sdcard_lock();
+    if (s_mounted) {
+        sdcard_unlock();
+        return ESP_OK;
+    }
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = s_host_id;
+    host.max_freq_khz = s_current_freq_khz;
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = WIMILL_PIN_SD_MOSI,
+        .miso_io_num = WIMILL_PIN_SD_MISO,
+        .sclk_io_num = WIMILL_PIN_SD_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = WIMILL_PIN_SD_CS;
+    slot_config.host_id = host.slot;
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = DEFAULT_ALLOC_UNIT,
+        .disk_status_check_enable = true,
+    };
+
+    esp_err_t ret = esp_vfs_fat_sdspi_mount(WIMILL_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+    if (ret == ESP_OK) {
+        s_mounted = true;
+    }
+    sdcard_unlock();
+    return ret;
 }
 
 esp_err_t sdcard_unmount(void)
 {
-    if (!sd_lock()) {
-        return ESP_FAIL;
-    }
-    esp_err_t ret = ESP_OK;
+    sdcard_lock();
     if (!s_mounted) {
-        goto out;
+        sdcard_unlock();
+        return ESP_OK;
     }
-    ret = esp_vfs_fat_sdcard_unmount(WIMILL_SD_MOUNT_POINT, s_card);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to unmount SD card: %s", esp_err_to_name(ret));
-        goto out;
-    }
-    s_card = NULL;
+    esp_err_t ret = esp_vfs_fat_sdcard_unmount(WIMILL_SD_MOUNT_POINT, s_card);
     s_mounted = false;
-    spi_bus_free(s_host_id);
-    ESP_LOGI(TAG, "SD unmounted");
-out:
-    sd_unlock();
+    sdcard_unlock();
     return ret;
 }
 
-static esp_err_t mount_filesystem(void)
-{
-    uint32_t candidates[3] = {0};
-    size_t candidate_count = 0;
-    candidates[candidate_count++] = s_current_freq_khz;
-    if (s_current_freq_khz > WIMILL_SD_FREQ_KHZ_20MHZ) {
-        candidates[candidate_count++] = WIMILL_SD_FREQ_KHZ_20MHZ;
-    }
-    if (s_current_freq_khz != WIMILL_SD_FREQ_KHZ_DEFAULT) {
-        candidates[candidate_count++] = WIMILL_SD_FREQ_KHZ_DEFAULT;
-    }
-
-    esp_err_t ret = ESP_FAIL;
-    for (size_t i = 0; i < candidate_count; ++i) {
-        uint32_t freq = candidates[i];
-        bool seen = false;
-        for (size_t j = 0; j < i; ++j) {
-            if (candidates[j] == freq) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen || !is_supported_freq(freq)) {
-            continue;
-        }
-
-        sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-        host.slot = s_host_id;
-        host.max_freq_khz = freq;
-
-        spi_bus_config_t bus_cfg = {
-            .mosi_io_num = WIMILL_PIN_SD_MOSI,
-            .miso_io_num = WIMILL_PIN_SD_MISO,
-            .sclk_io_num = WIMILL_PIN_SD_SCK,
-            .quadwp_io_num = -1,
-            .quadhd_io_num = -1,
-            .max_transfer_sz = 4000,
-        };
-
-        gpio_set_pull_mode(WIMILL_PIN_SD_MOSI, GPIO_PULLUP_ONLY);
-        gpio_set_pull_mode(WIMILL_PIN_SD_MISO, GPIO_PULLUP_ONLY);
-        gpio_set_pull_mode(WIMILL_PIN_SD_SCK, GPIO_PULLUP_ONLY);
-        gpio_set_pull_mode(WIMILL_PIN_SD_CS, GPIO_PULLUP_ONLY);
-
-        ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
-        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGE(TAG, "Failed to init SPI bus: %s", esp_err_to_name(ret));
-            continue;
-        }
-
-        sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-        slot_config.gpio_cs = WIMILL_PIN_SD_CS;
-        slot_config.host_id = host.slot;
-
-        esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-            .format_if_mount_failed = false,
-            .max_files = DEFAULT_MAX_FILES,
-            .allocation_unit_size = DEFAULT_ALLOC_UNIT,
-            .disk_status_check_enable = true,
-        };
-
-        ESP_LOGI(TAG, "Mounting SD at %s (freq %u kHz)", WIMILL_SD_MOUNT_POINT, host.max_freq_khz);
-        ret = esp_vfs_fat_sdspi_mount(WIMILL_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
-        if (ret == ESP_OK) {
-            s_current_freq_khz = freq;
-            s_mounted = true;
-            ESP_LOGI(TAG, "Mounted at %s", WIMILL_SD_MOUNT_POINT);
-            if (s_card) {
-                char name[8] = {0};
-                memcpy(name, s_card->cid.name, sizeof(s_card->cid.name));
-                const double size_mb = ((double)s_card->csd.capacity) * s_card->csd.sector_size / (1024.0 * 1024.0);
-                ESP_LOGI(TAG, "Card name: %s, size: %.2f MB", name, size_mb);
-            }
-            return ESP_OK;
-        }
-
-        log_mount_hint(ret);
-        if (ret != ESP_ERR_INVALID_STATE) {
-            spi_bus_free(host.slot);
-        }
-        ESP_LOGW(TAG, "Retrying mount at lower frequency...");
-    }
-
-    return ret;
-}
-
-esp_err_t sdcard_mount(void)
-{
-    if (!sd_lock()) {
-        return ESP_FAIL;
-    }
-    esp_err_t ret = ESP_OK;
-    if (!s_mounted) {
-        ret = mount_filesystem();
-    }
-    sd_unlock();
-    return ret;
-}
-
-bool sdcard_is_mounted(void)
-{
-    return s_mounted;
-}
-
-const char *sdcard_mount_point(void)
-{
-    return WIMILL_SD_MOUNT_POINT;
-}
-
-uint32_t sdcard_get_current_freq_khz(void)
-{
-    return s_current_freq_khz;
-}
-
-uint32_t sdcard_get_default_freq_khz(void)
-{
-    return WIMILL_SD_FREQ_KHZ_DEFAULT;
-}
+bool sdcard_is_mounted(void) { return s_mounted; }
+const char *sdcard_mount_point(void) { return WIMILL_SD_MOUNT_POINT; }
 
 esp_err_t sdcard_set_frequency(uint32_t freq_khz, bool remount)
 {
-    if (!sd_lock()) {
+    if (!sdcard_lock()) {
         return ESP_FAIL;
     }
     if (!is_supported_freq(freq_khz)) {
         ESP_LOGW(TAG, "Unsupported frequency: %u kHz", freq_khz);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_ARG;
     }
 
     if (s_current_freq_khz == freq_khz && (!remount || !s_mounted)) {
         ESP_LOGI(TAG, "SD frequency already set to %u kHz", freq_khz);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_OK;
     }
 
@@ -248,31 +224,29 @@ esp_err_t sdcard_set_frequency(uint32_t freq_khz, bool remount)
         ESP_LOGI(TAG, "Remounting SD to apply new frequency...");
         esp_err_t err = sdcard_unmount();
         if (err != ESP_OK) {
-            sd_unlock();
+            sdcard_unlock();
             ESP_LOGE(TAG, "Unmount failed: %s", esp_err_to_name(err));
             return err;
         }
         err = mount_filesystem();
-        sd_unlock();
+        sdcard_unlock();
         return err;
     }
 
-    sd_unlock();
+    sdcard_unlock();
     return ESP_OK;
 }
 
 esp_err_t sdcard_get_space(sd_space_info_t *info)
 {
-    if (!sd_lock()) {
-        return ESP_FAIL;
-    }
+    sdcard_lock();
     if (!info) {
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_mounted) {
         ESP_LOGE(TAG, "SD card is not mounted");
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -281,24 +255,24 @@ esp_err_t sdcard_get_space(sd_space_info_t *info)
     FRESULT res = f_getfree(WIMILL_SD_MOUNT_POINT, &free_clusters, &fs);
     if (res != FR_OK || !fs) {
         ESP_LOGE(TAG, "f_getfree failed: %d", res);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_FAIL;
     }
 
     uint64_t cluster_size = ((uint64_t)fs->csize) * 512; // bytes per cluster
     info->total_bytes = ((uint64_t)(fs->n_fatent - 2)) * cluster_size;
     info->free_bytes = ((uint64_t)free_clusters) * cluster_size;
-    sd_unlock();
+    sdcard_unlock();
     return ESP_OK;
 }
 
 esp_err_t sdcard_get_status(sdcard_status_t *out_status)
 {
-    if (!sd_lock()) {
+    if (!sdcard_lock()) {
         return ESP_FAIL;
     }
     if (!out_status) {
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_ARG;
     }
     memset(out_status, 0, sizeof(*out_status));
@@ -316,7 +290,7 @@ esp_err_t sdcard_get_status(sdcard_status_t *out_status)
             out_status->free_bytes = space.free_bytes;
         }
     }
-    sd_unlock();
+    sdcard_unlock();
     return ESP_OK;
 }
 
@@ -334,19 +308,19 @@ static esp_err_t build_path(const char *name, char *out, size_t out_size)
 
 esp_err_t sdcard_list_root(void)
 {
-    if (!sd_lock()) {
+    if (!sdcard_lock()) {
         return ESP_FAIL;
     }
     if (!s_mounted) {
         ESP_LOGE(TAG, "SD card is not mounted");
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
     DIR *dir = opendir(WIMILL_SD_MOUNT_POINT);
     if (!dir) {
         ESP_LOGE(TAG, "opendir failed: errno=%d", errno);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_FAIL;
     }
 
@@ -373,75 +347,75 @@ esp_err_t sdcard_list_root(void)
     }
 
     closedir(dir);
-    sd_unlock();
+    sdcard_unlock();
     return ESP_OK;
 }
 
 esp_err_t sdcard_remove(const char *name)
 {
-    if (!sd_lock()) {
+    if (!sdcard_lock()) {
         return ESP_FAIL;
     }
     if (!s_mounted) {
         ESP_LOGE(TAG, "SD card is not mounted");
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_STATE;
     }
     char path[256];
     esp_err_t ret = build_path(name, path, sizeof(path));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Path build failed");
-        sd_unlock();
+        sdcard_unlock();
         return ret;
     }
 
     struct stat st;
     if (stat(path, &st) != 0) {
         ESP_LOGE(TAG, "stat failed: %s (errno=%d)", path, errno);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_FAIL;
     }
     if (S_ISDIR(st.st_mode)) {
         ESP_LOGE(TAG, "%s is a directory (rm only handles files)", name);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_ARG;
     }
 
     if (unlink(path) != 0) {
         ESP_LOGE(TAG, "unlink failed: errno=%d", errno);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "Removed %s", name);
-    sd_unlock();
+    sdcard_unlock();
     return ESP_OK;
 }
 
 esp_err_t sdcard_mkdir(const char *name)
 {
-    if (!sd_lock()) {
+    if (!sdcard_lock()) {
         return ESP_FAIL;
     }
     if (!s_mounted) {
         ESP_LOGE(TAG, "SD card is not mounted");
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_STATE;
     }
     char path[256];
     esp_err_t ret = build_path(name, path, sizeof(path));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Path build failed");
-        sd_unlock();
+        sdcard_unlock();
         return ret;
     }
 
     if (mkdir(path, 0777) != 0) {
         ESP_LOGE(TAG, "mkdir failed (errno=%d)", errno);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "Created directory %s", name);
-    sd_unlock();
+    sdcard_unlock();
     return ESP_OK;
 }
 
@@ -461,26 +435,26 @@ static void print_hex_line(const uint8_t *data, size_t len)
 
 esp_err_t sdcard_cat(const char *name, size_t max_bytes)
 {
-    if (!sd_lock()) {
+    if (!sdcard_lock()) {
         return ESP_FAIL;
     }
     if (!s_mounted) {
         ESP_LOGE(TAG, "SD card is not mounted");
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_STATE;
     }
     char path[256];
     esp_err_t ret = build_path(name, path, sizeof(path));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Path build failed");
-        sd_unlock();
+        sdcard_unlock();
         return ret;
     }
 
     FILE *f = fopen(path, "rb");
     if (!f) {
         ESP_LOGE(TAG, "Failed to open %s (errno=%d)", path, errno);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_FAIL;
     }
 
@@ -496,32 +470,32 @@ esp_err_t sdcard_cat(const char *name, size_t max_bytes)
         print_hex_line(&buffer[offset], line_len);
     }
 
-    sd_unlock();
+    sdcard_unlock();
     return ESP_OK;
 }
 
 esp_err_t sdcard_touch(const char *name, size_t size_bytes)
 {
-    if (!sd_lock()) {
+    if (!sdcard_lock()) {
         return ESP_FAIL;
     }
     if (!s_mounted) {
         ESP_LOGE(TAG, "SD card is not mounted");
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_INVALID_STATE;
     }
     char path[256];
     esp_err_t ret = build_path(name, path, sizeof(path));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Path build failed");
-        sd_unlock();
+        sdcard_unlock();
         return ret;
     }
 
     FILE *f = fopen(path, "wb");
     if (!f) {
         ESP_LOGE(TAG, "Failed to create %s (errno=%d)", path, errno);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_FAIL;
     }
 
@@ -535,7 +509,7 @@ esp_err_t sdcard_touch(const char *name, size_t size_bytes)
         if (written != to_write) {
             ESP_LOGE(TAG, "Write failed at %zu bytes", size_bytes - remaining);
             fclose(f);
-            sd_unlock();
+            sdcard_unlock();
             return ESP_FAIL;
         }
         remaining -= written;
@@ -543,7 +517,7 @@ esp_err_t sdcard_touch(const char *name, size_t size_bytes)
 
     fclose(f);
     ESP_LOGI(TAG, "Created %s (%zu bytes)", name, size_bytes);
-    sd_unlock();
+    sdcard_unlock();
     return ESP_OK;
 }
 
@@ -566,27 +540,27 @@ static esp_err_t sdcard_run_self_test(size_t size_mb, uint32_t freq_khz, size_t 
         size_mb = 10;
     }
 
-    if (!sd_lock()) {
+    if (!sdcard_lock()) {
         return ESP_FAIL;
     }
 
     if (freq_khz != 0) {
         if (!is_supported_freq(freq_khz)) {
             ESP_LOGW(TAG, "Unsupported freq for test: %u kHz", freq_khz);
-            sd_unlock();
+            sdcard_unlock();
             return ESP_ERR_INVALID_ARG;
         }
         ESP_LOGI(TAG, "SDTEST: applying freq %u kHz", freq_khz);
         esp_err_t freq_ret = sdcard_set_frequency(freq_khz, sdcard_is_mounted());
         if (freq_ret != ESP_OK) {
-            sd_unlock();
+            sdcard_unlock();
             return freq_ret;
         }
     }
 
     esp_err_t ret = sdcard_mount();
     if (ret != ESP_OK) {
-        sd_unlock();
+        sdcard_unlock();
         return ret;
     }
 
@@ -611,7 +585,7 @@ static esp_err_t sdcard_run_self_test(size_t size_mb, uint32_t freq_khz, size_t 
         if (exp_buf) {
             heap_caps_free(exp_buf);
         }
-        sd_unlock();
+        sdcard_unlock();
         return ESP_ERR_NO_MEM;
     }
 
@@ -622,7 +596,7 @@ static esp_err_t sdcard_run_self_test(size_t size_mb, uint32_t freq_khz, size_t 
         ESP_LOGE(TAG, "SDTEST: cannot open %s for write", SDTEST_FILE_PATH);
         heap_caps_free(io_buf);
         heap_caps_free(exp_buf);
-        sd_unlock();
+        sdcard_unlock();
         return ESP_FAIL;
     }
 
@@ -718,7 +692,7 @@ cleanup_no_file:
     if (exp_buf) {
         heap_caps_free(exp_buf);
     }
-    sd_unlock();
+    sdcard_unlock();
     return ret;
 }
 

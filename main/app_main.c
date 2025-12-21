@@ -7,6 +7,7 @@
 
 #include "cli.h"
 #include "led_status.h"
+#include "msc.h"
 #include "sdcard.h"
 #include "wimill_pins.h"
 
@@ -32,14 +33,12 @@ void app_main(void)
     led_status_init();
     led_status_set(LED_STATE_BOOT);
 
-    esp_err_t err = sdcard_mount();
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "SD mount OK");
+    // SD will be used by MSC (raw) and by local ops when detached
+    if (sdcard_mount() == ESP_OK) {
         log_space();
-        sdcard_list_root();
-    } else {
-        ESP_LOGW(TAG, "Mount failed. Fix wiring/format and run 'mount' in CLI after reboot or wiring fix.");
     }
+
+    msc_init();
 
     if (cli_start() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start CLI");

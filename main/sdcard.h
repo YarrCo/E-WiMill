@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "sdmmc_cmd.h"
 
 typedef struct {
     uint64_t total_bytes;
@@ -22,10 +23,13 @@ typedef struct {
     uint64_t free_bytes;
 } sdcard_status_t;
 
+esp_err_t sdcard_init_raw(sdmmc_card_t **out_card);
 esp_err_t sdcard_mount(void);
 esp_err_t sdcard_unmount(void);
 bool sdcard_is_mounted(void);
 const char *sdcard_mount_point(void);
+void sdcard_lock(void);
+void sdcard_unlock(void);
 uint32_t sdcard_get_current_freq_khz(void);
 uint32_t sdcard_get_default_freq_khz(void);
 esp_err_t sdcard_set_frequency(uint32_t freq_khz, bool remount);

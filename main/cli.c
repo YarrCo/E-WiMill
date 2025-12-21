@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "msc.h"
 #include "sdcard.h"
 #include "wimill_pins.h"
 
@@ -41,6 +42,9 @@ void cli_print_help(void)
     printf("  mount             - retry SD mount\n");
     printf("  sd freq [kHz]     - show/set SD SPI freq (10000/20000/26000)\n");
     printf("  sdtest [mb] [kHz] [buf N] - write+verify file (default 10 MB, optional freq, optional buf bytes)\n");
+    printf("  usb status|attach|detach|idle <ms> - manage MSC state/timeout\n");
+    printf("  queue              - show pending file ops\n");
+    printf("  copytest <mb>      - enqueue copy test via safe scheduler\n");
 }
 
 static void print_prompt(void)
@@ -245,6 +249,64 @@ static void handle_sdtest(int argc, char *argv[])
     }
 }
 
+static void handle_usb(int argc, char *argv[])
+{
+    if (argc < 2) {
+        ESP_LOGW(TAG, "Usage: usb status|attach|detach|idle <ms>");
+        return;
+    }
+    const char *sub = argv[1];
+    if (strcmp(sub, "status") == 0) {
+        uint64_t last_ms = msc_last_activity_ms();
+        ESP_LOGI(TAG, "MSC state=%d, last activity=%llu ms, idle timeout=%u ms",
+                 (int)msc_get_state(),
+                 (unsigned long long)last_ms,
+                 msc_get_idle_timeout());
+    } else if (strcmp(sub, "attach") == 0) {
+        esp_err_t err = msc_force_attach();
+        ESP_LOGI(TAG, "usb attach: %s", esp_err_to_name(err));
+    } else if (strcmp(sub, "detach") == 0) {
+        esp_err_t err = msc_force_detach();
+        ESP_LOGI(TAG, "usb detach: %s", esp_err_to_name(err));
+    } else if (strcmp(sub, "idle") == 0) {
+        if (argc < 3) {
+            ESP_LOGI(TAG, "Idle timeout: %u ms", msc_get_idle_timeout());
+        } else {
+            uint32_t ms = (uint32_t)strtoul(argv[2], NULL, 10);
+            msc_set_idle_timeout(ms);
+            ESP_LOGI(TAG, "Idle timeout set to %u ms", ms);
+        }
+    } else {
+        ESP_LOGW(TAG, "Unknown usb subcommand");
+    }
+}
+
+static void handle_queue(void)
+{
+    msc_queue_dump();
+}
+
+static void handle_copytest(int argc, char *argv[])
+{
+    size_t mb = 1;
+    if (argc > 1) {
+        long v = strtol(argv[1], NULL, 10);
+        if (v > 0) {
+            mb = (size_t)v;
+        }
+    }
+    msc_op_t op = {
+        .type = MSC_OP_COPYTEST,
+        .size_mb = mb,
+    };
+    esp_err_t err = msc_enqueue_op(&op);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "copytest enqueued (%zu MB)", mb);
+    } else {
+        ESP_LOGE(TAG, "Failed to enqueue copytest: %s", esp_err_to_name(err));
+    }
+}
+
 static void execute_command(int argc, char *argv[])
 {
     if (argc <= 0) {
@@ -272,6 +334,12 @@ static void execute_command(int argc, char *argv[])
         handle_sd_freq(argc, argv);
     } else if (strcmp(cmd, "sdtest") == 0) {
         handle_sdtest(argc, argv);
+    } else if (strcmp(cmd, "usb") == 0) {
+        handle_usb(argc, argv);
+    } else if (strcmp(cmd, "queue") == 0) {
+        handle_queue();
+    } else if (strcmp(cmd, "copytest") == 0) {
+        handle_copytest(argc, argv);
     } else {
         ESP_LOGW(TAG, "Unknown command: %s", cmd);
         cli_print_help();
