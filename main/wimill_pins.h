@@ -14,5 +14,8 @@
 
 // SD SPI frequency control (kHz)
 #define WIMILL_SD_FREQ_KHZ_DEFAULT 10000
-#define WIMILL_SD_FREQ_KHZ_4MHZ     4000
-#define WIMILL_SD_FREQ_KHZ_1MHZ     1000
+#define WIMILL_SD_FREQ_KHZ_20MHZ    20000
+#define WIMILL_SD_FREQ_KHZ_26MHZ    26000
+
+// SD self-test buffer size (bytes)
+#define WIMILL_SDTEST_BUF_SZ 16384

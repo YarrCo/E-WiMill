@@ -19,9 +19,10 @@
 #define CLI_STACK_SIZE 4096
 #define CLI_PRIORITY 5
 #define CLI_MAX_LINE_LEN 128
-#define CLI_MAX_ARGS 4
+#define CLI_MAX_ARGS 8
 #define CLI_DEFAULT_CAT_BYTES 256
 #define CLI_DEFAULT_SDTEST_MB 10
+#define CLI_DEFAULT_SDTEST_BUF WIMILL_SDTEST_BUF_SZ
 
 static void cli_task(void *arg);
 static void trim_newline(char *line);
@@ -38,8 +39,8 @@ void cli_print_help(void)
     printf("  cat <name>        - show first %d bytes (hex+ascii)\n", CLI_DEFAULT_CAT_BYTES);
     printf("  touch <name> <n>  - create file with n zero bytes\n");
     printf("  mount             - retry SD mount\n");
-    printf("  sd freq [kHz]     - show/set SD SPI freq (1000/4000/10000)\n");
-    printf("  sdtest [mb] [kHz] - write+verify file (default 10 MB, optional freq)\n");
+    printf("  sd freq [kHz]     - show/set SD SPI freq (10000/20000/26000)\n");
+    printf("  sdtest [mb] [kHz] [buf N] - write+verify file (default 10 MB, optional freq, optional buf bytes)\n");
 }
 
 static void print_prompt(void)
@@ -113,6 +114,7 @@ static void handle_info(void)
 
     ESP_LOGI(TAG, "Status: %s", st.mounted ? "mounted" : "unmounted");
     ESP_LOGI(TAG, "Freq: current=%u kHz default=%u kHz", st.current_freq_khz, st.default_freq_khz);
+    ESP_LOGI(TAG, "SDTEST buffer: %u bytes, alloc_unit=%u", st.sdtest_buf_bytes, st.allocation_unit);
     if (st.mounted) {
         double total_mb = (double)st.total_bytes / (1024.0 * 1024.0);
         double free_mb = (double)st.free_bytes / (1024.0 * 1024.0);
@@ -208,20 +210,38 @@ static void handle_sdtest(int argc, char *argv[])
 {
     size_t size_mb = CLI_DEFAULT_SDTEST_MB;
     uint32_t freq = 0;
+    size_t buf_bytes = CLI_DEFAULT_SDTEST_BUF;
+    bool size_set = false;
 
-    if (argc > 1) {
-        long v = strtol(argv[1], NULL, 10);
-        if (v > 0) {
-            size_mb = (size_t)v;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "buf") == 0 && (i + 1) < argc) {
+            long v = strtol(argv[i + 1], NULL, 10);
+            if (v > 0) {
+                buf_bytes = (size_t)v;
+            } else {
+                ESP_LOGW(TAG, "Invalid buf size: %s", argv[i + 1]);
+            }
+            ++i;
+            continue;
+        }
+
+        char *end = NULL;
+        long v = strtol(argv[i], &end, 10);
+        if (end != argv[i] && v > 0) {
+            if (!size_set) {
+                size_mb = (size_t)v;
+                size_set = true;
+            } else {
+                freq = (uint32_t)v;
+            }
         }
     }
-    if (argc > 2) {
-        freq = (uint32_t)strtoul(argv[2], NULL, 10);
-    }
 
-    esp_err_t err = sdcard_self_test(size_mb, freq);
+    esp_err_t err = sdcard_self_test(size_mb, freq, buf_bytes);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SDTEST failed (err=%s)", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "SDTEST started in background");
     }
 }
 
