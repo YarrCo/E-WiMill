@@ -3,10 +3,12 @@ idf_component_register(
         "app_main.c"
         "sdcard.c"
         "cli.c"
+        "led_status.c"
     INCLUDE_DIRS
         "."
     REQUIRES
         fatfs
         driver
         esp_timer
+        led_strip
 )

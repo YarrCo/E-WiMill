@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 
 #include "cli.h"
+#include "led_status.h"
 #include "sdcard.h"
 #include "wimill_pins.h"
 
@@ -23,10 +24,13 @@ static void log_space(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "E-WiMill MVP-01: SD Mount + File Manager (Serial)");
+    ESP_LOGI(TAG, "E-WiMill MVP-02: USB MSC + SD");
     ESP_LOGI(TAG, "SPI pins - CS:%d SCK:%d MOSI:%d MISO:%d", WIMILL_PIN_SD_CS, WIMILL_PIN_SD_SCK,
              WIMILL_PIN_SD_MOSI, WIMILL_PIN_SD_MISO);
     ESP_LOGI(TAG, "Default SD freq: %u kHz", WIMILL_SD_FREQ_KHZ_DEFAULT);
+
+    led_status_init();
+    led_status_set(LED_STATE_BOOT);
 
     esp_err_t err = sdcard_mount();
     if (err == ESP_OK) {
@@ -42,6 +46,8 @@ void app_main(void)
     } else {
         cli_print_help();
     }
+
+    led_status_set(LED_STATE_USB_ATTACHED);
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));

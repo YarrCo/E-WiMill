@@ -19,3 +19,7 @@
 
 // SD self-test buffer size (bytes)
 #define WIMILL_SDTEST_BUF_SZ 16384
+
+// RGB LED (WS2812/NeoPixel) on GPIO48 (optional, fail-safe if absent)
+#define WIMILL_RGB_GPIO 48
+#define WIMILL_RGB_COUNT 1

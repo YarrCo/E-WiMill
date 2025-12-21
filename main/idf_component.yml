@@ -1,0 +1,3 @@
+dependencies:
+  espressif/tinyusb: "*"
+  espressif/led_strip: "*"
