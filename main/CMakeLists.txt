@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "sdcard.c"
+        "cli.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        fatfs
+        driver
+        esp_timer
+)
