@@ -1,5 +1,6 @@
 #include "msc.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 #include "esp_check.h"
@@ -73,99 +74,33 @@ static esp_err_t load_cache(uint32_t lba)
     return ESP_OK;
 }
 
-static esp_err_t msc_read_blocks(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
+static esp_err_t msc_read_partial(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
     if (!s_card) {
         return ESP_ERR_INVALID_STATE;
     }
-    const uint32_t blk_sz = s_block_size;
-    esp_err_t ret = flush_cache(); // ensure card has latest data
-    if (ret != ESP_OK) {
-        return ret;
+    if ((offset + bufsize) > s_block_size) {
+        return ESP_ERR_INVALID_ARG;
     }
-
-    uint32_t buf_off = 0;
-    uint32_t addr_off = offset;
-    while (buf_off < bufsize) {
-        uint32_t cur_lba = lba + addr_off / blk_sz;
-        uint32_t sector_off = addr_off % blk_sz;
-        uint32_t chunk = blk_sz - sector_off;
-        if (chunk > (bufsize - buf_off)) {
-            chunk = bufsize - buf_off;
-        }
-
-        if (sector_off == 0 && chunk == blk_sz) {
-            // Fast path for full aligned sectors (can batch multiple)
-            uint32_t remaining_bytes = bufsize - buf_off;
-            uint32_t full_sectors = remaining_bytes / blk_sz;
-            ret = sdmmc_read_sectors(s_card, buffer + buf_off, cur_lba, full_sectors);
-            if (ret != ESP_OK) {
-                return ret;
-            }
-            uint32_t consumed = full_sectors * blk_sz;
-            buf_off += consumed;
-            addr_off += consumed;
-            continue;
-        }
-
-        ret = load_cache(cur_lba);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        memcpy(buffer + buf_off, s_cache.data + sector_off, chunk);
-        buf_off += chunk;
-        addr_off += chunk;
-    }
+    ESP_RETURN_ON_ERROR(load_cache(lba), TAG, "load cache failed");
+    memcpy(buffer, s_cache.data + offset, bufsize);
     return ESP_OK;
 }
 
-static esp_err_t msc_write_blocks(uint32_t lba, uint32_t offset, const uint8_t *buffer, uint32_t bufsize)
+static esp_err_t msc_write_partial(uint32_t lba, uint32_t offset, const uint8_t *buffer, uint32_t bufsize)
 {
     if (!s_card) {
         return ESP_ERR_INVALID_STATE;
     }
-    const uint32_t blk_sz = s_block_size;
-    esp_err_t ret = ESP_OK;
-
-    uint32_t buf_off = 0;
-    uint32_t addr_off = offset;
-    while (buf_off < bufsize) {
-        uint32_t cur_lba = lba + addr_off / blk_sz;
-        uint32_t sector_off = addr_off % blk_sz;
-        uint32_t chunk = blk_sz - sector_off;
-        if (chunk > (bufsize - buf_off)) {
-            chunk = bufsize - buf_off;
-        }
-
-        if (sector_off == 0 && chunk == blk_sz) {
-            // Write one or more full sectors directly
-            uint32_t remaining_bytes = bufsize - buf_off;
-            uint32_t full_sectors = remaining_bytes / blk_sz;
-            ESP_RETURN_ON_ERROR(flush_cache(), TAG, "flush before full write failed");
-            ret = sdmmc_write_sectors(s_card, buffer + buf_off, cur_lba, full_sectors);
-            if (ret != ESP_OK) {
-                return ret;
-            }
-            uint32_t consumed = full_sectors * blk_sz;
-            buf_off += consumed;
-            addr_off += consumed;
-            continue;
-        }
-
-        // Partial sector: read-modify-write via cache
-        ret = load_cache(cur_lba);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        memcpy(s_cache.data + sector_off, buffer + buf_off, chunk);
-        s_cache.dirty = true;
-        ret = flush_cache();
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        buf_off += chunk;
-        addr_off += chunk;
+    if ((offset + bufsize) > s_block_size) {
+        return ESP_ERR_INVALID_ARG;
     }
+    if (s_cache.valid && s_cache.dirty && s_cache.lba != lba) {
+        ESP_RETURN_ON_ERROR(flush_cache(), TAG, "flush before switching LBA failed");
+    }
+    ESP_RETURN_ON_ERROR(load_cache(lba), TAG, "load cache failed");
+    memcpy(s_cache.data + offset, buffer, bufsize);
+    s_cache.dirty = true;
     return ESP_OK;
 }
 
@@ -226,7 +161,22 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
 {
     (void)lun;
     lock_io();
-    esp_err_t ret = msc_read_blocks(lba, offset, (uint8_t *)buffer, bufsize);
+    esp_err_t ret;
+
+    if (offset == 0 && (bufsize % s_block_size) == 0) {
+        // Flush dirty cache to keep coherence before direct read
+        if (s_cache.valid && s_cache.dirty) {
+            ret = flush_cache();
+            if (ret != ESP_OK) {
+                goto read_err;
+            }
+        }
+        uint32_t sectors = bufsize / s_block_size;
+        ret = sdmmc_read_sectors(s_card, buffer, lba, sectors);
+    } else {
+        ret = msc_read_partial(lba, offset, (uint8_t *)buffer, bufsize);
+    }
+
     unlock_io();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "READ10 failed lba=%lu off=%lu size=%lu err=%s",
@@ -235,13 +185,37 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
         return -1;
     }
     return (int32_t)bufsize;
+
+read_err:
+    unlock_io();
+    ESP_LOGE(TAG, "READ10 failed lba=%lu off=%lu size=%lu err=%s",
+             (unsigned long)lba, (unsigned long)offset, (unsigned long)bufsize, esp_err_to_name(ret));
+    tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x03, 0x00);
+    return -1;
 }
 
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
     (void)lun;
     lock_io();
-    esp_err_t ret = msc_write_blocks(lba, offset, buffer, bufsize);
+    esp_err_t ret;
+
+    if (offset == 0 && (bufsize % s_block_size) == 0) {
+        if (s_cache.valid && s_cache.dirty) {
+            ret = flush_cache();
+            if (ret != ESP_OK) {
+                goto write_err;
+            }
+        }
+        uint32_t sectors = bufsize / s_block_size;
+        ret = sdmmc_write_sectors(s_card, buffer, lba, sectors);
+        // Invalidate cache so subsequent partial accesses reload fresh data
+        s_cache.valid = false;
+        s_cache.dirty = false;
+    } else {
+        ret = msc_write_partial(lba, offset, buffer, bufsize);
+    }
+
     unlock_io();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "WRITE10 failed lba=%lu off=%lu size=%lu err=%s",
@@ -250,14 +224,18 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
         return -1;
     }
     return (int32_t)bufsize;
+
+write_err:
+    unlock_io();
+    ESP_LOGE(TAG, "WRITE10 failed lba=%lu off=%lu size=%lu err=%s",
+             (unsigned long)lba, (unsigned long)offset, (unsigned long)bufsize, esp_err_to_name(ret));
+    tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x03, 0x00);
+    return -1;
 }
 
 void tud_msc_write10_complete_cb(uint8_t lun)
 {
     (void)lun;
-    lock_io();
-    flush_cache();
-    unlock_io();
 }
 
 bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject)
@@ -280,4 +258,13 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
 
     tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
     return -1;
+}
+
+bool tud_msc_flush_cb(uint8_t lun)
+{
+    (void)lun;
+    lock_io();
+    esp_err_t ret = flush_cache();
+    unlock_io();
+    return ret == ESP_OK;
 }
