@@ -281,7 +281,7 @@ esp_err_t msc_detach(void)
 
 // --- TinyUSB Callbacks ---
 
-uint8_t tud_msc_get_maxlun_cb(void) { return 1; }
+uint8_t tud_msc_get_maxlun_cb(void) { return 0; }
 
 void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4])
 {

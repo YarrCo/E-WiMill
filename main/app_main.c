@@ -14,6 +14,13 @@
 
 void app_main(void)
 {
+    // Fix for slow USB init: silence the noisy drivers!
+    esp_log_level_set("sdspi_transaction", ESP_LOG_ERROR);
+    esp_log_level_set("sdspi_host", ESP_LOG_ERROR);
+    esp_log_level_set("sdmmc_req", ESP_LOG_ERROR);
+    esp_log_level_set("sdmmc_cmd", ESP_LOG_ERROR);
+    esp_log_level_set("sdmmc_init", ESP_LOG_ERROR);
+
     ESP_LOGI(TAG, "E-WiMill MSC debug build: raw SDSPI + manual MSC callbacks");
     ESP_LOGI(TAG, "SPI pins - CS:%d SCK:%d MOSI:%d MISO:%d", WIMILL_PIN_SD_CS, WIMILL_PIN_SD_SCK,
              WIMILL_PIN_SD_MOSI, WIMILL_PIN_SD_MISO);
