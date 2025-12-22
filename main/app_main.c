@@ -23,18 +23,21 @@ void app_main(void)
     led_status_set(LED_STATE_BOOT);
 
     esp_err_t err = msc_init();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "MSC init failed: %s", esp_err_to_name(err));
         led_status_set(LED_STATE_ERROR);
         return;
     }
 
     err = cli_start();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "CLI start failed: %s", esp_err_to_name(err));
     }
 
-    while (true) {
+    while (true)
+    {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
