@@ -1,281 +1,283 @@
 #include "msc.h"
 
-#include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 #include "freertos/semphr.h"
-#include "freertos/task.h"
 #include "sdmmc_cmd.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
-#include "tinyusb_msc.h"
 #include "tusb.h"
 
 #include "led_status.h"
 #include "sdcard.h"
-#include "wimill_pins.h"
 
 #define TAG "MSC"
+#define MSC_SECTOR_SIZE 512
 
-#define MSC_QUEUE_LEN 4
-#define MSC_TASK_STACK 4096
-#define MSC_TASK_PRIO 5
-#define MSC_ALLOC_UNIT (32 * 1024)
+typedef struct {
+    bool valid;
+    bool dirty;
+    uint32_t lba;
+    uint8_t data[MSC_SECTOR_SIZE] __attribute__((aligned(4)));
+} sector_cache_t;
 
-static msc_state_t s_state = MSC_STATE_USB_ATTACHED;
-static uint64_t s_last_activity_us = 0;
-static uint32_t s_idle_timeout_ms = 15000;
-static QueueHandle_t s_op_queue = NULL;
-static TaskHandle_t s_msc_task = NULL;
 static sdmmc_card_t *s_card = NULL;
-static tinyusb_msc_storage_handle_t s_storage = NULL;
+static uint32_t s_block_size = MSC_SECTOR_SIZE;
+static uint32_t s_block_count = 0;
+static sector_cache_t s_cache = {0};
+static SemaphoreHandle_t s_io_mutex = NULL;
 
-static void set_state(msc_state_t st)
+static inline void lock_io(void)
 {
-    if (s_state != st) {
-        ESP_LOGI(TAG, "State change: %d -> %d", s_state, st);
-        s_state = st;
-        switch (s_state) {
-        case MSC_STATE_USB_ATTACHED:
-            led_status_set(LED_STATE_USB_ATTACHED);
-            break;
-        case MSC_STATE_USB_DETACHED:
-            led_status_set(LED_STATE_USB_DETACHED);
-            break;
-        case MSC_STATE_ATTACHING:
-        case MSC_STATE_DETACHING:
-            led_status_set(LED_STATE_QUEUE_WAIT);
-            break;
-        case MSC_STATE_ERROR:
-            led_status_set(LED_STATE_ERROR);
-            break;
-        default:
-            break;
-        }
+    if (s_io_mutex) {
+        xSemaphoreTake(s_io_mutex, portMAX_DELAY);
     }
 }
 
-static bool usb_idle_elapsed(void)
+static inline void unlock_io(void)
 {
-    uint64_t now = esp_timer_get_time();
-    uint64_t diff_ms = (now - s_last_activity_us) / 1000ULL;
-    return diff_ms >= s_idle_timeout_ms;
+    if (s_io_mutex) {
+        xSemaphoreGive(s_io_mutex);
+    }
 }
 
-static esp_err_t set_mount_point(tinyusb_msc_mount_point_t target)
+static esp_err_t flush_cache(void)
 {
-    if (!s_storage) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    tinyusb_msc_mount_point_t current;
-    ESP_RETURN_ON_ERROR(tinyusb_msc_get_storage_mount_point(s_storage, &current), TAG, "get mount point failed");
-    if (current == target) {
+    if (!s_cache.valid || !s_cache.dirty) {
         return ESP_OK;
     }
-    esp_err_t ret = tinyusb_msc_set_storage_mount_point(s_storage, target);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to switch mount point to %d: %s", target, esp_err_to_name(ret));
-    }
-    return ret;
-}
-
-static void update_activity(void)
-{
-    s_last_activity_us = esp_timer_get_time();
-}
-
-void msc_on_usb_activity(void)
-{
-    update_activity();
-}
-
-void msc_on_usb_rw(bool write, uint32_t lba, uint32_t bytes)
-{
-    (void)write;
-    (void)lba;
-    (void)bytes;
-    update_activity();
-}
-
-static void storage_event_cb(tinyusb_msc_storage_handle_t handle, tinyusb_msc_event_t *event, void *arg)
-{
-    (void)handle;
-    (void)arg;
-    ESP_LOGI(TAG, "MSC event id=%d mount_point=%d", event->id, event->mount_point);
-    if (event->id == TINYUSB_MSC_EVENT_MOUNT_COMPLETE) {
-        if (event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB) {
-            set_state(MSC_STATE_USB_ATTACHED);
-            sdcard_set_mounted(false);
-        } else if (event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP) {
-            set_state(MSC_STATE_USB_DETACHED);
-            sdcard_set_mounted(true);
-        }
-    }
-}
-
-static void msc_task(void *arg)
-{
-    (void)arg;
-    for (;;) {
-        msc_op_t op;
-        if (xQueueReceive(s_op_queue, &op, pdMS_TO_TICKS(500)) == pdTRUE) {
-            if (!usb_idle_elapsed()) {
-                ESP_LOGW(TAG, "USB busy, requeue op");
-                xQueueSendToBack(s_op_queue, &op, 0);
-                vTaskDelay(pdMS_TO_TICKS(500));
-                continue;
-            }
-            // detach (switch to APP mount)
-            set_state(MSC_STATE_DETACHING);
-            if (set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_APP) != ESP_OK) {
-                set_state(MSC_STATE_ERROR);
-                continue;
-            }
-
-            // perform op (copytest only for now)
-            if (op.type == MSC_OP_COPYTEST) {
-                const char *tmp_path = WIMILL_SD_MOUNT_POINT "/copytest.part";
-                const char *final_path = WIMILL_SD_MOUNT_POINT "/copytest.bin";
-                ESP_LOGI(TAG, "COPYTEST %zu MB", op.size_mb);
-                sdcard_lock();
-                FILE *f = fopen(tmp_path, "wb");
-                if (f) {
-                    size_t total = op.size_mb * 1024 * 1024;
-                    size_t chunk = 4096;
-                    uint8_t *buf = malloc(chunk);
-                    if (buf) {
-                        memset(buf, 0xAA, chunk);
-                        size_t written = 0;
-                        while (written < total) {
-                            size_t to_write = (total - written) > chunk ? chunk : (total - written);
-                            if (fwrite(buf, 1, to_write, f) != to_write) {
-                                ESP_LOGE(TAG, "copytest write failed at %zu", written);
-                                break;
-                            }
-                            written += to_write;
-                        }
-                        free(buf);
-                        fflush(f);
-                        fsync(fileno(f));
-                        fclose(f);
-                        rename(tmp_path, final_path);
-                        ESP_LOGI(TAG, "copytest done: %s (%zu bytes)", final_path, total);
-                    } else {
-                        ESP_LOGE(TAG, "copytest malloc failed");
-                        fclose(f);
-                    }
-                } else {
-                    ESP_LOGE(TAG, "copytest open failed");
-                }
-                sdcard_unlock();
-            }
-
-            // attach back to USB
-            set_state(MSC_STATE_ATTACHING);
-            set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_USB);
-            set_state(MSC_STATE_USB_ATTACHED);
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
-}
-
-void msc_init(void)
-{
-    s_op_queue = xQueueCreate(MSC_QUEUE_LEN, sizeof(msc_op_t));
-    s_last_activity_us = esp_timer_get_time();
-
-    // Init raw card (SDSPI)
-    ESP_ERROR_CHECK(sdcard_init_raw(&s_card));
-
-    // TinyUSB driver install (using tusb_config.h descriptors)
-    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
-    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
-
-    tinyusb_msc_storage_config_t storage_cfg = {
-        .medium.card = s_card,
-        .fat_fs = {
-            .base_path = WIMILL_SD_MOUNT_POINT,
-            .config = {
-                .format_if_mount_failed = false,
-                .max_files = 5,
-                .allocation_unit_size = MSC_ALLOC_UNIT,
-                .disk_status_check_enable = true,
-            },
-            .do_not_format = true,
-            .format_flags = FM_ANY,
-        },
-        .mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB,
-    };
-    ESP_ERROR_CHECK(tinyusb_msc_new_storage_sdmmc(&storage_cfg, &s_storage));
-    tinyusb_msc_set_storage_callback(storage_event_cb, NULL);
-
-    xTaskCreatePinnedToCore(msc_task, "msc_task", MSC_TASK_STACK, NULL, MSC_TASK_PRIO, &s_msc_task, tskNO_AFFINITY);
-    set_state(MSC_STATE_USB_ATTACHED);
-    ESP_LOGI(TAG, "MSC init done, state USB_ATTACHED");
-}
-
-msc_state_t msc_get_state(void)
-{
-    return s_state;
-}
-
-uint64_t msc_last_activity_ms(void)
-{
-    return s_last_activity_us / 1000ULL;
-}
-
-esp_err_t msc_force_attach(void)
-{
-    esp_err_t ret = set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_USB);
+    esp_err_t ret = sdmmc_write_sectors(s_card, s_cache.data, s_cache.lba, 1);
     if (ret == ESP_OK) {
-        set_state(MSC_STATE_USB_ATTACHED);
+        s_cache.dirty = false;
     }
     return ret;
 }
 
-esp_err_t msc_force_detach(void)
+static esp_err_t load_cache(uint32_t lba)
 {
-    if (!usb_idle_elapsed()) {
+    if (s_cache.valid && s_cache.lba == lba) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(flush_cache(), TAG, "flush failed before load");
+
+    esp_err_t ret = sdmmc_read_sectors(s_card, s_cache.data, lba, 1);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    s_cache.valid = true;
+    s_cache.dirty = false;
+    s_cache.lba = lba;
+    return ESP_OK;
+}
+
+static esp_err_t msc_read_blocks(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
+{
+    if (!s_card) {
         return ESP_ERR_INVALID_STATE;
     }
-    esp_err_t ret = set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_APP);
-    if (ret == ESP_OK) {
-        set_state(MSC_STATE_USB_DETACHED);
+    const uint32_t blk_sz = s_block_size;
+    esp_err_t ret = flush_cache(); // ensure card has latest data
+    if (ret != ESP_OK) {
+        return ret;
     }
-    return ret;
-}
 
-esp_err_t msc_set_idle_timeout(uint32_t ms)
-{
-    s_idle_timeout_ms = ms;
+    uint32_t buf_off = 0;
+    uint32_t addr_off = offset;
+    while (buf_off < bufsize) {
+        uint32_t cur_lba = lba + addr_off / blk_sz;
+        uint32_t sector_off = addr_off % blk_sz;
+        uint32_t chunk = blk_sz - sector_off;
+        if (chunk > (bufsize - buf_off)) {
+            chunk = bufsize - buf_off;
+        }
+
+        if (sector_off == 0 && chunk == blk_sz) {
+            // Fast path for full aligned sectors (can batch multiple)
+            uint32_t remaining_bytes = bufsize - buf_off;
+            uint32_t full_sectors = remaining_bytes / blk_sz;
+            ret = sdmmc_read_sectors(s_card, buffer + buf_off, cur_lba, full_sectors);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            uint32_t consumed = full_sectors * blk_sz;
+            buf_off += consumed;
+            addr_off += consumed;
+            continue;
+        }
+
+        ret = load_cache(cur_lba);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        memcpy(buffer + buf_off, s_cache.data + sector_off, chunk);
+        buf_off += chunk;
+        addr_off += chunk;
+    }
     return ESP_OK;
 }
 
-uint32_t msc_get_idle_timeout(void)
+static esp_err_t msc_write_blocks(uint32_t lba, uint32_t offset, const uint8_t *buffer, uint32_t bufsize)
 {
-    return s_idle_timeout_ms;
-}
-
-esp_err_t msc_enqueue_op(const msc_op_t *op)
-{
-    if (!op) {
-        return ESP_ERR_INVALID_ARG;
+    if (!s_card) {
+        return ESP_ERR_INVALID_STATE;
     }
-    if (xQueueSendToBack(s_op_queue, op, 0) != pdTRUE) {
-        return ESP_ERR_NO_MEM;
+    const uint32_t blk_sz = s_block_size;
+    esp_err_t ret = ESP_OK;
+
+    uint32_t buf_off = 0;
+    uint32_t addr_off = offset;
+    while (buf_off < bufsize) {
+        uint32_t cur_lba = lba + addr_off / blk_sz;
+        uint32_t sector_off = addr_off % blk_sz;
+        uint32_t chunk = blk_sz - sector_off;
+        if (chunk > (bufsize - buf_off)) {
+            chunk = bufsize - buf_off;
+        }
+
+        if (sector_off == 0 && chunk == blk_sz) {
+            // Write one or more full sectors directly
+            uint32_t remaining_bytes = bufsize - buf_off;
+            uint32_t full_sectors = remaining_bytes / blk_sz;
+            ESP_RETURN_ON_ERROR(flush_cache(), TAG, "flush before full write failed");
+            ret = sdmmc_write_sectors(s_card, buffer + buf_off, cur_lba, full_sectors);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            uint32_t consumed = full_sectors * blk_sz;
+            buf_off += consumed;
+            addr_off += consumed;
+            continue;
+        }
+
+        // Partial sector: read-modify-write via cache
+        ret = load_cache(cur_lba);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        memcpy(s_cache.data + sector_off, buffer + buf_off, chunk);
+        s_cache.dirty = true;
+        ret = flush_cache();
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        buf_off += chunk;
+        addr_off += chunk;
     }
     return ESP_OK;
 }
 
-void msc_queue_dump(void)
+esp_err_t msc_init(void)
 {
-    UBaseType_t pending = uxQueueMessagesWaiting(s_op_queue);
-    ESP_LOGI(TAG, "Queue pending ops: %lu", (unsigned long)pending);
+    s_io_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_io_mutex != NULL, ESP_ERR_NO_MEM, TAG, "no mutex");
+
+    ESP_RETURN_ON_ERROR(sdcard_init_raw(&s_card), TAG, "sd init failed");
+    s_block_size = s_card->csd.sector_size ? s_card->csd.sector_size : MSC_SECTOR_SIZE;
+    s_block_count = s_card->csd.capacity;
+    memset(&s_cache, 0, sizeof(s_cache));
+
+    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    ESP_RETURN_ON_ERROR(tinyusb_driver_install(&tusb_cfg), TAG, "tinyusb init failed");
+
+    led_status_set(LED_STATE_USB_ATTACHED);
+    ESP_LOGI(TAG, "MSC ready: blocks=%u block_size=%u", (unsigned)s_block_count, (unsigned)s_block_size);
+    return ESP_OK;
+}
+
+// ---------------- TinyUSB MSC callbacks ----------------
+
+uint8_t tud_msc_get_maxlun_cb(void)
+{
+    return 1;
+}
+
+void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4])
+{
+    (void)lun;
+    const char vid[] = "WIMILL";
+    const char pid[] = "SDSPI MSC";
+    const char rev[] = "0.1";
+    memcpy(vendor_id, vid, sizeof(vid) - 1);
+    memcpy(product_id, pid, sizeof(pid) - 1);
+    memcpy(product_rev, rev, sizeof(rev) - 1);
+}
+
+bool tud_msc_test_unit_ready_cb(uint8_t lun)
+{
+    (void)lun;
+    if (!s_card) {
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00); // medium not present
+        return false;
+    }
+    return true;
+}
+
+void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size)
+{
+    (void)lun;
+    *block_count = s_block_count;
+    *block_size = (uint16_t)s_block_size;
+}
+
+int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
+{
+    (void)lun;
+    lock_io();
+    esp_err_t ret = msc_read_blocks(lba, offset, (uint8_t *)buffer, bufsize);
+    unlock_io();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "READ10 failed lba=%lu off=%lu size=%lu err=%s",
+                 (unsigned long)lba, (unsigned long)offset, (unsigned long)bufsize, esp_err_to_name(ret));
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x03, 0x00);
+        return -1;
+    }
+    return (int32_t)bufsize;
+}
+
+int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
+{
+    (void)lun;
+    lock_io();
+    esp_err_t ret = msc_write_blocks(lba, offset, buffer, bufsize);
+    unlock_io();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WRITE10 failed lba=%lu off=%lu size=%lu err=%s",
+                 (unsigned long)lba, (unsigned long)offset, (unsigned long)bufsize, esp_err_to_name(ret));
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x03, 0x00);
+        return -1;
+    }
+    return (int32_t)bufsize;
+}
+
+void tud_msc_write10_complete_cb(uint8_t lun)
+{
+    (void)lun;
+    lock_io();
+    flush_cache();
+    unlock_io();
+}
+
+bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject)
+{
+    (void)lun;
+    (void)power_condition;
+    (void)load_eject;
+    return start;
+}
+
+int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, uint16_t bufsize)
+{
+    (void)lun;
+    (void)buffer;
+    (void)bufsize;
+
+    if (scsi_cmd[0] == SCSI_CMD_PREVENT_ALLOW_MEDIUM_REMOVAL) {
+        return 0;
+    }
+
+    tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
+    return -1;
 }

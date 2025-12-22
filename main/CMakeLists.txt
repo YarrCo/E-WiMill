@@ -2,15 +2,13 @@ idf_component_register(
     SRCS
         "app_main.c"
         "sdcard.c"
-        "cli.c"
         "led_status.c"
         "msc.c"
     INCLUDE_DIRS
         "."
     REQUIRES
-        fatfs
         driver
-        esp_timer
+        sdmmc
         led_strip
         esp_tinyusb
 )
