@@ -23,7 +23,8 @@ static bool is_supported_freq(uint32_t khz)
 
 esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
 {
-    if (!out_card) {
+    if (!out_card)
+    {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -37,7 +38,7 @@ esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
         .sclk_io_num = WIMILL_PIN_SD_SCK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
+        .max_transfer_sz = 8192,
     };
 
     gpio_set_pull_mode(WIMILL_PIN_SD_MOSI, GPIO_PULLUP_ONLY);
@@ -46,7 +47,8 @@ esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
     gpio_set_pull_mode(WIMILL_PIN_SD_CS, GPIO_PULLUP_ONLY);
 
     esp_err_t ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+    {
         return ret;
     }
 
@@ -56,17 +58,20 @@ esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
 
     sdspi_dev_handle_t dev_handle = 0;
     ret = sdspi_host_init_device(&slot_config, &dev_handle);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE)
+    {
         return ret;
     }
 
     sdmmc_card_t *card = calloc(1, sizeof(sdmmc_card_t));
-    if (!card) {
+    if (!card)
+    {
         return ESP_ERR_NO_MEM;
     }
 
     ret = sdmmc_card_init(&host, card);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         free(card);
         return ret;
     }
@@ -87,7 +92,8 @@ uint32_t sdcard_get_current_freq_khz(void)
 
 esp_err_t sdcard_set_frequency(uint32_t freq_khz)
 {
-    if (!is_supported_freq(freq_khz)) {
+    if (!is_supported_freq(freq_khz))
+    {
         return ESP_ERR_INVALID_ARG;
     }
     s_current_freq_khz = freq_khz;
