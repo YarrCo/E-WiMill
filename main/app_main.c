@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "cli.h"
 #include "led_status.h"
 #include "msc.h"
 #include "wimill_pins.h"
@@ -26,6 +27,11 @@ void app_main(void)
         ESP_LOGE(TAG, "MSC init failed: %s", esp_err_to_name(err));
         led_status_set(LED_STATE_ERROR);
         return;
+    }
+
+    err = cli_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "CLI start failed: %s", esp_err_to_name(err));
     }
 
     while (true) {

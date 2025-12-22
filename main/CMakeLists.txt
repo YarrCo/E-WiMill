@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "app_main.c"
+        "cli.c"
         "sdcard.c"
         "led_status.c"
         "msc.c"
@@ -9,6 +10,9 @@ idf_component_register(
     REQUIRES
         driver
         sdmmc
+        fatfs
         led_strip
         esp_tinyusb
+    PRIV_REQUIRES
+        esp_timer
 )
