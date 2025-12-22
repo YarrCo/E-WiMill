@@ -11,6 +11,7 @@ typedef enum {
     MSC_STATE_USB_DETACHED,
     MSC_STATE_DETACHING,
     MSC_STATE_ATTACHING,
+    MSC_STATE_ERROR,
 } msc_state_t;
 
 void msc_init(void);

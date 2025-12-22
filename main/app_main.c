@@ -33,11 +33,7 @@ void app_main(void)
     led_status_init();
     led_status_set(LED_STATE_BOOT);
 
-    // SD will be used by MSC (raw) and by local ops when detached
-    if (sdcard_mount() == ESP_OK) {
-        log_space();
-    }
-
+    // Raw init will be done inside msc_init (without VFS)
     msc_init();
 
     if (cli_start() != ESP_OK) {

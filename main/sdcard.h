@@ -28,6 +28,7 @@ esp_err_t sdcard_mount(void);
 esp_err_t sdcard_unmount(void);
 bool sdcard_is_mounted(void);
 const char *sdcard_mount_point(void);
+void sdcard_set_mounted(bool mounted);
 void sdcard_lock(void);
 void sdcard_unlock(void);
 uint32_t sdcard_get_current_freq_khz(void);

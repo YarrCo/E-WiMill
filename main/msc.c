@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
@@ -12,8 +13,11 @@
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
 #include "tinyusb.h"
-#include "tusb_msc_storage.h"
+#include "tinyusb_default_config.h"
+#include "tinyusb_msc.h"
+#include "tusb.h"
 
+#include "led_status.h"
 #include "sdcard.h"
 #include "wimill_pins.h"
 
@@ -22,19 +26,38 @@
 #define MSC_QUEUE_LEN 4
 #define MSC_TASK_STACK 4096
 #define MSC_TASK_PRIO 5
+#define MSC_ALLOC_UNIT (32 * 1024)
 
 static msc_state_t s_state = MSC_STATE_USB_ATTACHED;
 static uint64_t s_last_activity_us = 0;
 static uint32_t s_idle_timeout_ms = 15000;
-static SemaphoreHandle_t s_state_mutex = NULL;
 static QueueHandle_t s_op_queue = NULL;
 static TaskHandle_t s_msc_task = NULL;
+static sdmmc_card_t *s_card = NULL;
+static tinyusb_msc_storage_handle_t s_storage = NULL;
 
 static void set_state(msc_state_t st)
 {
     if (s_state != st) {
         ESP_LOGI(TAG, "State change: %d -> %d", s_state, st);
         s_state = st;
+        switch (s_state) {
+        case MSC_STATE_USB_ATTACHED:
+            led_status_set(LED_STATE_USB_ATTACHED);
+            break;
+        case MSC_STATE_USB_DETACHED:
+            led_status_set(LED_STATE_USB_DETACHED);
+            break;
+        case MSC_STATE_ATTACHING:
+        case MSC_STATE_DETACHING:
+            led_status_set(LED_STATE_QUEUE_WAIT);
+            break;
+        case MSC_STATE_ERROR:
+            led_status_set(LED_STATE_ERROR);
+            break;
+        default:
+            break;
+        }
     }
 }
 
@@ -45,16 +68,55 @@ static bool usb_idle_elapsed(void)
     return diff_ms >= s_idle_timeout_ms;
 }
 
+static esp_err_t set_mount_point(tinyusb_msc_mount_point_t target)
+{
+    if (!s_storage) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    tinyusb_msc_mount_point_t current;
+    ESP_RETURN_ON_ERROR(tinyusb_msc_get_storage_mount_point(s_storage, &current), TAG, "get mount point failed");
+    if (current == target) {
+        return ESP_OK;
+    }
+    esp_err_t ret = tinyusb_msc_set_storage_mount_point(s_storage, target);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to switch mount point to %d: %s", target, esp_err_to_name(ret));
+    }
+    return ret;
+}
+
 static void update_activity(void)
 {
     s_last_activity_us = esp_timer_get_time();
 }
 
-static void msc_mount_sdmmc(void)
+void msc_on_usb_activity(void)
 {
-    // SD is mounted by our sdcard.c; tinyusb_msc_storage_init_sdmmc expects sdmmc_card_t*
-    // But we are using SDSPI so we can reuse sdmmc_card_t pointer from sdcard.c by adding accessor if needed.
-    // For now, we assume sdcard_mount already done and we cannot hand over card directly.
+    update_activity();
+}
+
+void msc_on_usb_rw(bool write, uint32_t lba, uint32_t bytes)
+{
+    (void)write;
+    (void)lba;
+    (void)bytes;
+    update_activity();
+}
+
+static void storage_event_cb(tinyusb_msc_storage_handle_t handle, tinyusb_msc_event_t *event, void *arg)
+{
+    (void)handle;
+    (void)arg;
+    ESP_LOGI(TAG, "MSC event id=%d mount_point=%d", event->id, event->mount_point);
+    if (event->id == TINYUSB_MSC_EVENT_MOUNT_COMPLETE) {
+        if (event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB) {
+            set_state(MSC_STATE_USB_ATTACHED);
+            sdcard_set_mounted(false);
+        } else if (event->mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP) {
+            set_state(MSC_STATE_USB_DETACHED);
+            sdcard_set_mounted(true);
+        }
+    }
 }
 
 static void msc_task(void *arg)
@@ -69,20 +131,54 @@ static void msc_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(500));
                 continue;
             }
-            // detach
+            // detach (switch to APP mount)
             set_state(MSC_STATE_DETACHING);
-            tinyusb_msc_storage_unmount(); // stop exposing
-            set_state(MSC_STATE_USB_DETACHED);
-
-            // perform op (placeholder copytest)
-            if (op.type == MSC_OP_COPYTEST) {
-                ESP_LOGI(TAG, "COPYTEST %zu MB (placeholder)", op.size_mb);
-                // TODO: implement real copytest via sdcard API with mount
+            if (set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_APP) != ESP_OK) {
+                set_state(MSC_STATE_ERROR);
+                continue;
             }
 
-            // attach back
+            // perform op (copytest only for now)
+            if (op.type == MSC_OP_COPYTEST) {
+                const char *tmp_path = WIMILL_SD_MOUNT_POINT "/copytest.part";
+                const char *final_path = WIMILL_SD_MOUNT_POINT "/copytest.bin";
+                ESP_LOGI(TAG, "COPYTEST %zu MB", op.size_mb);
+                sdcard_lock();
+                FILE *f = fopen(tmp_path, "wb");
+                if (f) {
+                    size_t total = op.size_mb * 1024 * 1024;
+                    size_t chunk = 4096;
+                    uint8_t *buf = malloc(chunk);
+                    if (buf) {
+                        memset(buf, 0xAA, chunk);
+                        size_t written = 0;
+                        while (written < total) {
+                            size_t to_write = (total - written) > chunk ? chunk : (total - written);
+                            if (fwrite(buf, 1, to_write, f) != to_write) {
+                                ESP_LOGE(TAG, "copytest write failed at %zu", written);
+                                break;
+                            }
+                            written += to_write;
+                        }
+                        free(buf);
+                        fflush(f);
+                        fsync(fileno(f));
+                        fclose(f);
+                        rename(tmp_path, final_path);
+                        ESP_LOGI(TAG, "copytest done: %s (%zu bytes)", final_path, total);
+                    } else {
+                        ESP_LOGE(TAG, "copytest malloc failed");
+                        fclose(f);
+                    }
+                } else {
+                    ESP_LOGE(TAG, "copytest open failed");
+                }
+                sdcard_unlock();
+            }
+
+            // attach back to USB
             set_state(MSC_STATE_ATTACHING);
-            tinyusb_msc_storage_mount("/sdcard");
+            set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_USB);
             set_state(MSC_STATE_USB_ATTACHED);
         } else {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -92,18 +188,33 @@ static void msc_task(void *arg)
 
 void msc_init(void)
 {
-    s_state_mutex = xSemaphoreCreateMutex();
     s_op_queue = xQueueCreate(MSC_QUEUE_LEN, sizeof(msc_op_t));
     s_last_activity_us = esp_timer_get_time();
 
-    // TinyUSB driver install (simple config; descriptors default from esp_tinyusb)
-    tinyusb_config_t tusb_cfg = {
-        .external_phy = false,
-    };
+    // Init raw card (SDSPI)
+    ESP_ERROR_CHECK(sdcard_init_raw(&s_card));
+
+    // TinyUSB driver install (using tusb_config.h descriptors)
+    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
-    // Init storage using SDMMC/SD over SDSPI already initialised
-    // Note: For SDSPI, esp_tinyusb doesn't have helper; we will use sdmmc_card_t* from sdcard.c if exposed.
+    tinyusb_msc_storage_config_t storage_cfg = {
+        .medium.card = s_card,
+        .fat_fs = {
+            .base_path = WIMILL_SD_MOUNT_POINT,
+            .config = {
+                .format_if_mount_failed = false,
+                .max_files = 5,
+                .allocation_unit_size = MSC_ALLOC_UNIT,
+                .disk_status_check_enable = true,
+            },
+            .do_not_format = true,
+            .format_flags = FM_ANY,
+        },
+        .mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB,
+    };
+    ESP_ERROR_CHECK(tinyusb_msc_new_storage_sdmmc(&storage_cfg, &s_storage));
+    tinyusb_msc_set_storage_callback(storage_event_cb, NULL);
 
     xTaskCreatePinnedToCore(msc_task, "msc_task", MSC_TASK_STACK, NULL, MSC_TASK_PRIO, &s_msc_task, tskNO_AFFINITY);
     set_state(MSC_STATE_USB_ATTACHED);
@@ -122,18 +233,23 @@ uint64_t msc_last_activity_ms(void)
 
 esp_err_t msc_force_attach(void)
 {
-    set_state(MSC_STATE_ATTACHING);
-    ESP_RETURN_ON_ERROR(tinyusb_msc_storage_mount("/sdcard"), TAG, "attach failed");
-    set_state(MSC_STATE_USB_ATTACHED);
-    return ESP_OK;
+    esp_err_t ret = set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_USB);
+    if (ret == ESP_OK) {
+        set_state(MSC_STATE_USB_ATTACHED);
+    }
+    return ret;
 }
 
 esp_err_t msc_force_detach(void)
 {
-    set_state(MSC_STATE_DETACHING);
-    ESP_RETURN_ON_ERROR(tinyusb_msc_storage_unmount(), TAG, "detach failed");
-    set_state(MSC_STATE_USB_DETACHED);
-    return ESP_OK;
+    if (!usb_idle_elapsed()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t ret = set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_APP);
+    if (ret == ESP_OK) {
+        set_state(MSC_STATE_USB_DETACHED);
+    }
+    return ret;
 }
 
 esp_err_t msc_set_idle_timeout(uint32_t ms)

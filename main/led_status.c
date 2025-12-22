@@ -50,6 +50,9 @@ static void led_task(void *arg)
             blink_pattern(64, 0, 0, 100, 200);
             blink_pattern(64, 0, 0, 100, 800);
             break;
+        case LED_STATE_QUEUE_WAIT:
+            blink_pattern(48, 0, 48, 150, 500);
+            break;
         default:
             vTaskDelay(pdMS_TO_TICKS(500));
             break;

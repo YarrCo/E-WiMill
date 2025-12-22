@@ -7,6 +7,7 @@ typedef enum {
     LED_STATE_USB_ATTACHED,
     LED_STATE_USB_DETACHED,
     LED_STATE_ERROR,
+    LED_STATE_QUEUE_WAIT,
 } led_state_t;
 
 void led_status_init(void);

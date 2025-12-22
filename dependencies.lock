@@ -1,4 +1,10 @@
 dependencies:
+  espressif/esp_tinyusb:
+    dependencies: []
+    source:
+      path: C:\Users\Charlie\Documents\Project_ESP32\E-WiMill\components\espressif__esp_tinyusb
+      type: local
+    version: 2.0.1~1
   espressif/led_strip:
     component_hash: f0d1b7f93eb3ee57bcfd220656176b0b5616e1947f89ed44364555cf910c4840
     dependencies:
@@ -29,8 +35,10 @@ dependencies:
       type: idf
     version: 5.5.1
 direct_dependencies:
+- espressif/esp_tinyusb
 - espressif/led_strip
 - espressif/tinyusb
-manifest_hash: d4c0509df27b6a5e46872e5a4cc24f686152561613186993fb5b3b50211a4bc4
+- idf
+manifest_hash: 11f24becb6a84a9ba21f46c18f31c24822ce5ca58ef0778f46764dbdba1bd92c
 target: esp32s3
 version: 2.0.0
