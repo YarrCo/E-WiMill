@@ -12,7 +12,6 @@
 #include "sdmmc_cmd.h"
 #include "tinyusb.h"
 #include "tusb.h"             // Main TinyUSB header
-#include "tusb_msc_storage.h" // Helpers for MSC
 
 #include "led_status.h"
 #include "sdcard.h"
