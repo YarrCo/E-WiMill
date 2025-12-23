@@ -72,6 +72,28 @@ static void setup_breathe(void)
     }
 }
 
+static void normal_breathe(uint8_t r, uint8_t g, uint8_t b, uint32_t step_ms)
+{
+    for (int level = 0; level <= 64; level += 2) {
+        if (s_setup_active) {
+            return;
+        }
+        set_color((uint8_t)((r * level) / 64),
+                  (uint8_t)((g * level) / 64),
+                  (uint8_t)((b * level) / 64));
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+    for (int level = 64; level >= 0; level -= 2) {
+        if (s_setup_active) {
+            return;
+        }
+        set_color((uint8_t)((r * level) / 64),
+                  (uint8_t)((g * level) / 64),
+                  (uint8_t)((b * level) / 64));
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+}
+
 static void led_task(void *arg)
 {
     (void)arg;
@@ -90,10 +112,10 @@ static void led_task(void *arg)
             s_state = LED_STATE_USB_ATTACHED;
             break;
         case LED_STATE_USB_ATTACHED:
-            blink_pattern(0, 0, 64, 200, 1800);
+            normal_breathe(6, 87, 33, 40);
             break;
         case LED_STATE_USB_DETACHED:
-            blink_pattern(64, 32, 0, 100, 400);
+            normal_breathe(6, 87, 33, 40);
             break;
         case LED_STATE_ERROR:
             blink_pattern(64, 0, 0, 100, 200);
