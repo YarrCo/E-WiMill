@@ -2,9 +2,12 @@ idf_component_register(
     SRCS
         "app_main.c"
         "cli.c"
+        "config_store.c"
+        "button_longpress.c"
         "sdcard.c"
         "led_status.c"
         "msc.c"
+        "setup_mode.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -13,6 +16,12 @@ idf_component_register(
         fatfs
         led_strip
         esp_tinyusb
+        esp_http_server
+        esp_netif
+        esp_event
+        esp_wifi
+        nvs_flash
+        mdns
     PRIV_REQUIRES
         esp_timer
 )

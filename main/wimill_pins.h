@@ -9,6 +9,9 @@
 // Default UART console speed
 #define WIMILL_UART_BAUD 115200
 
+// Setup mode button (active-low)
+#define WIMILL_PIN_SETUP_BTN 21
+
 // Mount point for the FATFS
 #define WIMILL_SD_MOUNT_POINT "/sdcard"
 

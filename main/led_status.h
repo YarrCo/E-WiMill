@@ -12,3 +12,4 @@ typedef enum {
 
 void led_status_init(void);
 void led_status_set(led_state_t state);
+void led_status_set_setup(bool active);
