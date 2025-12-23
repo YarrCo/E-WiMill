@@ -11,7 +11,7 @@
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
 #include "tinyusb.h"
-#include "tusb.h"             // Main TinyUSB header
+#include "tusb.h" // Main TinyUSB header
 
 #include "led_status.h"
 #include "sdcard.h"
@@ -26,8 +26,8 @@
 #define USB_PID 0x4002
 #define EPNUM_MSC_OUT 0x01
 #define EPNUM_MSC_IN 0x81
-#define TUD_MSC_DESC_LEN (9 + 9 + 7 + 7)
-
+// #define TUD_MSC_DESC_LEN (9 + 9 + 7 + 7)
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_MSC_DESC_LEN)
 // Device Descriptor
 static const tusb_desc_device_t desc_device = {
     .bLength = sizeof(tusb_desc_device_t),
@@ -48,7 +48,7 @@ static const tusb_desc_device_t desc_device = {
 // Configuration Descriptor
 static const uint8_t desc_configuration[] = {
     // Config number, interface count, string index, total length, attribute, power in mA
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUD_MSC_DESC_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
     // Interface number, string index, EP Out & EP In address, EP size
     TUD_MSC_DESCRIPTOR(0, 0, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
 };
