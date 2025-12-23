@@ -20,6 +20,7 @@
 #define TAG "MSC"
 #define MSC_SECTOR_SIZE 512
 #define MSC_DETACH_DELAY_MS 500
+#define MSC_READAHEAD_SECTORS 8
 
 // --- USB DESCRIPTORS (MANUAL) ---
 #define USB_VID 0x303A
@@ -70,12 +71,21 @@ typedef struct
     uint8_t data[MSC_SECTOR_SIZE] __attribute__((aligned(4)));
 } sector_cache_t;
 
+typedef struct
+{
+    bool valid;
+    uint32_t lba;
+    uint32_t count;
+    uint8_t data[MSC_READAHEAD_SECTORS * MSC_SECTOR_SIZE] __attribute__((aligned(4)));
+} read_ahead_cache_t;
+
 static sdmmc_card_t *s_card = NULL;
 static uint32_t s_block_size = MSC_SECTOR_SIZE;
 static uint32_t s_block_count = 0;
-static bool s_usb_enabled = false;
+static bool s_usb_installed = false;
 static msc_state_t s_state = MSC_STATE_USB_DETACHED;
 static sector_cache_t s_cache = {0};
+static read_ahead_cache_t s_read_ahead = {0};
 
 static inline void lock_io(void)
 {
@@ -112,7 +122,15 @@ static esp_err_t flush_cache_locked(void)
         return ESP_OK;
     esp_err_t ret = sdmmc_write_sectors(s_card, s_cache.data, s_cache.lba, 1);
     if (ret == ESP_OK)
+    {
         s_cache.dirty = false;
+        if (s_read_ahead.valid)
+        {
+            uint32_t ra_end = s_read_ahead.lba + s_read_ahead.count;
+            if (s_cache.lba >= s_read_ahead.lba && s_cache.lba < ra_end)
+                s_read_ahead.valid = false;
+        }
+    }
     return ret;
 }
 
@@ -154,14 +172,17 @@ static esp_err_t msc_write_partial(uint32_t lba, uint32_t offset, const uint8_t 
     ESP_RETURN_ON_ERROR(load_cache_locked(lba), TAG, "load failed");
     memcpy(s_cache.data + offset, buffer, bufsize);
     s_cache.dirty = true;
+    if (s_read_ahead.valid)
+    {
+        uint32_t ra_end = s_read_ahead.lba + s_read_ahead.count;
+        if (lba >= s_read_ahead.lba && lba < ra_end)
+            s_read_ahead.valid = false;
+    }
     return ESP_OK;
 }
 
 static esp_err_t msc_enable(void)
 {
-    if (s_usb_enabled)
-        return ESP_OK;
-
     // Инициализация карты
     ESP_RETURN_ON_ERROR(sdcard_init_raw(&s_card), TAG, "sd init failed");
 
@@ -170,6 +191,7 @@ static esp_err_t msc_enable(void)
     s_block_count = s_card->csd.capacity; // Без умножения!
 
     memset(&s_cache, 0, sizeof(s_cache));
+    memset(&s_read_ahead, 0, sizeof(s_read_ahead));
 
     // !!! ИСПРАВЛЕНИЕ 2: Ручные дескрипторы !!!
     tinyusb_config_t tusb_cfg = {
@@ -200,27 +222,29 @@ static esp_err_t msc_enable(void)
         .event_arg = NULL,
     };
 
-    ESP_RETURN_ON_ERROR(tinyusb_driver_install(&tusb_cfg), TAG, "tinyusb init failed");
+    if (!s_usb_installed)
+    {
+        ESP_RETURN_ON_ERROR(tinyusb_driver_install(&tusb_cfg), TAG, "tinyusb init failed");
+        s_usb_installed = true;
+    }
 
     tud_connect();
-    s_usb_enabled = true;
     return ESP_OK;
 }
 
 static void msc_disable(void)
 {
-    if (!s_usb_enabled)
+    if (!s_usb_installed)
         return;
     lock_io();
     flush_cache_locked();
     s_cache.valid = false;
+    s_read_ahead.valid = false;
     unlock_io();
 
     tud_disconnect();
     // Даем время хосту понять отключение
     vTaskDelay(pdMS_TO_TICKS(100));
-    tinyusb_driver_uninstall();
-    s_usb_enabled = false;
     s_card = NULL;
 }
 
@@ -317,7 +341,58 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
         if (s_cache.valid && s_cache.dirty)
             flush_cache_locked();
         uint32_t sectors = bufsize / s_block_size;
-        ret = sdmmc_read_sectors(s_card, buffer, lba, sectors);
+        if (s_block_count > 0 && (lba + sectors) > s_block_count)
+        {
+            ret = ESP_ERR_INVALID_SIZE;
+        }
+        else
+        {
+            bool served = false;
+            if (s_read_ahead.valid)
+            {
+                uint32_t ra_end = s_read_ahead.lba + s_read_ahead.count;
+                if (lba >= s_read_ahead.lba && (lba + sectors) <= ra_end)
+                {
+                    uint32_t offset_sectors = lba - s_read_ahead.lba;
+                    memcpy(buffer, s_read_ahead.data + (offset_sectors * s_block_size), bufsize);
+                    served = true;
+                    ret = ESP_OK;
+                }
+            }
+
+            if (!served)
+            {
+                if (sectors <= MSC_READAHEAD_SECTORS)
+                {
+                    uint32_t ra_sectors = MSC_READAHEAD_SECTORS;
+                    if (s_block_count > 0)
+                    {
+                        uint32_t remaining = s_block_count - lba;
+                        if (remaining < ra_sectors)
+                            ra_sectors = remaining;
+                    }
+                    if (ra_sectors == 0 || ra_sectors < sectors)
+                    {
+                        ret = ESP_ERR_INVALID_SIZE;
+                    }
+                    else
+                    {
+                        ret = sdmmc_read_sectors(s_card, s_read_ahead.data, lba, ra_sectors);
+                        if (ret == ESP_OK)
+                        {
+                            s_read_ahead.valid = true;
+                            s_read_ahead.lba = lba;
+                            s_read_ahead.count = ra_sectors;
+                            memcpy(buffer, s_read_ahead.data, bufsize);
+                        }
+                    }
+                }
+                else
+                {
+                    ret = sdmmc_read_sectors(s_card, buffer, lba, sectors);
+                }
+            }
+        }
     }
     else
     {
@@ -351,6 +426,13 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
         if (s_cache.valid && s_cache.lba >= lba && s_cache.lba < (lba + sectors))
         {
             s_cache.valid = false;
+        }
+        if (s_read_ahead.valid)
+        {
+            uint32_t ra_end = s_read_ahead.lba + s_read_ahead.count;
+            uint32_t write_end = lba + sectors;
+            if (lba < ra_end && write_end > s_read_ahead.lba)
+                s_read_ahead.valid = false;
         }
         ret = sdmmc_write_sectors(s_card, buffer, lba, sectors);
     }

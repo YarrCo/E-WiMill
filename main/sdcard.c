@@ -10,6 +10,8 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/sdspi_host.h"
+#include "diskio_impl.h"
+#include "diskio_sdmmc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -29,6 +31,7 @@
 
 static sdmmc_card_t *s_card = NULL;
 static bool s_card_raw_alloc = false;
+static bool s_raw_ready = false;
 static bool s_mounted = false;
 static spi_host_device_t s_host_id = SPI2_HOST;
 static sdspi_dev_handle_t s_dev_handle = 0;
@@ -37,6 +40,8 @@ static uint32_t s_current_freq_khz = WIMILL_SD_FREQ_KHZ_DEFAULT;
 static SemaphoreHandle_t s_fs_mutex = NULL;
 static size_t s_sdtest_buf_bytes = WIMILL_SDTEST_BUF_SZ;
 static sdcard_mode_t s_mode = SDCARD_MODE_USB;
+static FATFS *s_fs = NULL;
+static uint8_t s_pdrv = FF_DRV_NOT_USED;
 
 static bool is_supported_freq(uint32_t khz)
 {
@@ -137,6 +142,7 @@ static void sdcard_free_raw_locked(void)
     }
     s_card = NULL;
     s_card_raw_alloc = false;
+    s_raw_ready = false;
 }
 
 esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
@@ -152,6 +158,11 @@ esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
     if (s_mounted) {
         sdcard_unlock();
         return ESP_ERR_INVALID_STATE;
+    }
+    if (s_raw_ready && s_card && s_dev_handle && s_bus_inited) {
+        *out_card = s_card;
+        sdcard_unlock();
+        return ESP_OK;
     }
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
@@ -217,6 +228,7 @@ esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
         sdcard_unlock();
         return ret;
     }
+    s_raw_ready = true;
 
     *out_card = s_card;
 
@@ -265,32 +277,10 @@ esp_err_t sdcard_mount(void)
         sdcard_unlock();
         return ESP_OK;
     }
-
-    sdspi_bus_deinit_locked();
-    sdcard_free_raw_locked();
-
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = s_host_id;
-    host.max_freq_khz = s_current_freq_khz;
-
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = WIMILL_PIN_SD_MOSI,
-        .miso_io_num = WIMILL_PIN_SD_MISO,
-        .sclk_io_num = WIMILL_PIN_SD_SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = SDSPI_MAX_TRANSFER,
-    };
-
-    esp_err_t ret = sdspi_bus_init_locked(&bus_cfg);
-    if (ret != ESP_OK) {
+    if (!s_raw_ready || !s_card) {
         sdcard_unlock();
-        return ret;
+        return ESP_ERR_INVALID_STATE;
     }
-
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = WIMILL_PIN_SD_CS;
-    slot_config.host_id = host.slot;
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
@@ -299,15 +289,46 @@ esp_err_t sdcard_mount(void)
         .disk_status_check_enable = true,
     };
 
-    ret = esp_vfs_fat_sdspi_mount(WIMILL_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
-    if (ret == ESP_OK) {
-        s_mounted = true;
-        s_card_raw_alloc = false;
-    } else {
-        s_card = NULL;
+    uint8_t pdrv = s_pdrv;
+    if (pdrv == FF_DRV_NOT_USED) {
+        if (ff_diskio_get_drive(&pdrv) != ESP_OK || pdrv == FF_DRV_NOT_USED) {
+            sdcard_unlock();
+            return ESP_ERR_NO_MEM;
+        }
+        s_pdrv = pdrv;
     }
+
+    ff_diskio_register_sdmmc(pdrv, s_card);
+    ff_sdmmc_set_disk_status_check(pdrv, mount_config.disk_status_check_enable);
+
+    char drv[3] = { (char)('0' + pdrv), ':', 0 };
+    esp_vfs_fat_conf_t conf = {
+        .base_path = WIMILL_SD_MOUNT_POINT,
+        .fat_drive = drv,
+        .max_files = mount_config.max_files,
+    };
+
+    esp_err_t ret = esp_vfs_fat_register_cfg(&conf, &s_fs);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ff_diskio_unregister(pdrv);
+        s_pdrv = FF_DRV_NOT_USED;
+        sdcard_unlock();
+        return ret;
+    }
+
+    FRESULT res = f_mount(s_fs, drv, 1);
+    if (res != FR_OK) {
+        esp_vfs_fat_unregister_path(WIMILL_SD_MOUNT_POINT);
+        ff_diskio_unregister(pdrv);
+        s_pdrv = FF_DRV_NOT_USED;
+        s_fs = NULL;
+        sdcard_unlock();
+        return ESP_FAIL;
+    }
+
+    s_mounted = true;
     sdcard_unlock();
-    return ret;
+    return ESP_OK;
 }
 
 esp_err_t sdcard_unmount(void)
@@ -321,15 +342,19 @@ esp_err_t sdcard_unmount(void)
         sdcard_unlock();
         return ESP_OK;
     }
-    esp_err_t ret = esp_vfs_fat_sdcard_unmount(WIMILL_SD_MOUNT_POINT, s_card);
-    if (ret == ESP_OK) {
-        s_mounted = false;
-        s_card = NULL;
-        s_card_raw_alloc = false;
-        sdspi_bus_deinit_locked();
+    if (s_pdrv == FF_DRV_NOT_USED) {
+        sdcard_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
+    char drv[3] = { (char)('0' + s_pdrv), ':', 0 };
+    f_mount(0, drv, 0);
+    ff_diskio_unregister(s_pdrv);
+    esp_vfs_fat_unregister_path(WIMILL_SD_MOUNT_POINT);
+    s_pdrv = FF_DRV_NOT_USED;
+    s_fs = NULL;
+    s_mounted = false;
     sdcard_unlock();
-    return ret;
+    return ESP_OK;
 }
 
 bool sdcard_is_mounted(void) { return s_mounted; }
