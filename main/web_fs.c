@@ -17,12 +17,19 @@
 
 #define TAG "WEBFS"
 #define FILE_BUF_SIZE 2048
+#define UPLOAD_HEADER_SIZE 8192
+#define UPLOAD_TAIL_SIZE 96
+#define UPLOAD_WORK_SIZE (FILE_BUF_SIZE + UPLOAD_TAIL_SIZE)
 #define MAX_QUERY_LEN 128
 #define MAX_PATH_LEN 256
 #define MAX_NAME_LEN 96
 #define MAX_BODY_LEN 512
 
 static SemaphoreHandle_t s_fileop_mutex = NULL;
+static char s_upload_header[UPLOAD_HEADER_SIZE];
+static char s_upload_buf[FILE_BUF_SIZE];
+static char s_upload_work[UPLOAD_WORK_SIZE];
+static char s_upload_tail[UPLOAD_TAIL_SIZE];
 
 static void send_json_error(httpd_req_t *req, const char *status, const char *json)
 {
@@ -42,6 +49,22 @@ static char *find_seq(const char *buf, size_t len, const char *seq, size_t seq_l
         }
     }
     return NULL;
+}
+
+static char *find_header_end(const char *buf, size_t len, size_t *mark_len)
+{
+    char *pos = find_seq(buf, len, "\r\n\r\n", 4);
+    if (pos) {
+        if (mark_len) {
+            *mark_len = 4;
+        }
+        return pos;
+    }
+    pos = find_seq(buf, len, "\n\n", 2);
+    if (pos && mark_len) {
+        *mark_len = 2;
+    }
+    return pos;
 }
 
 static bool fs_gate(httpd_req_t *req)
@@ -342,6 +365,22 @@ static bool get_query_path(httpd_req_t *req, char *out, size_t out_len)
     return normalize_path(decoded, out, out_len);
 }
 
+static bool get_query_flag(httpd_req_t *req, const char *key)
+{
+    char query[MAX_QUERY_LEN] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return false;
+    }
+    char val[8] = {0};
+    if (httpd_query_key_value(query, key, val, sizeof(val)) != ESP_OK) {
+        return false;
+    }
+    for (size_t i = 0; val[i] && i < sizeof(val); ++i) {
+        val[i] = (char)tolower((unsigned char)val[i]);
+    }
+    return (strcmp(val, "1") == 0 || strcmp(val, "true") == 0 || strcmp(val, "yes") == 0 || strcmp(val, "on") == 0);
+}
+
 static bool read_body(httpd_req_t *req, char *buf, size_t buf_len)
 {
     int total = req->content_len;
@@ -351,6 +390,9 @@ static bool read_body(httpd_req_t *req, char *buf, size_t buf_len)
     int received = 0;
     while (received < total) {
         int r = httpd_req_recv(req, buf + received, total - received);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
         if (r <= 0) {
             return false;
         }
@@ -415,6 +457,9 @@ static void drain_body(httpd_req_t *req)
     int remaining = req->content_len;
     while (remaining > 0) {
         int r = httpd_req_recv(req, buf, remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
         if (r <= 0) {
             break;
         }
@@ -425,25 +470,25 @@ static void drain_body(httpd_req_t *req)
 static esp_err_t http_fs_list(httpd_req_t *req)
 {
     if (!fs_gate(req)) {
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char rel_path[MAX_PATH_LEN];
     if (!get_query_path(req, rel_path, sizeof(rel_path))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char full_path[MAX_PATH_LEN];
     if (!build_fs_path(rel_path, full_path, sizeof(full_path))) {
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"PATH_FAIL\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     DIR *dir = opendir(full_path);
     if (!dir) {
         send_json_error(req, "404 Not Found", "{\"error\":\"NOT_FOUND\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -517,19 +562,20 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
 {
     if (!fs_gate(req)) {
         drain_body(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
     if (!fileop_try_lock(req)) {
         drain_body(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
-    esp_err_t result = ESP_FAIL;
+    esp_err_t result = ESP_OK;
     char rel_dir[MAX_PATH_LEN];
     if (!get_query_path(req, rel_dir, sizeof(rel_dir))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
         goto cleanup;
     }
+    bool overwrite = get_query_flag(req, "overwrite");
 
     char content_type[128];
     if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK) {
@@ -549,34 +595,49 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
     if (semi) {
         *semi = '\0';
     }
+    size_t blen = strlen(boundary);
+    if (blen >= 2 && boundary[0] == '"' && boundary[blen - 1] == '"') {
+        memmove(boundary, boundary + 1, blen - 2);
+        boundary[blen - 2] = '\0';
+    }
     if (boundary[0] == '\0') {
         send_json_error(req, "400 Bad Request", "{\"error\":\"NO_BOUNDARY\"}");
         goto cleanup;
     }
 
-    char header_buf[1024];
+    char *header_buf = s_upload_header;
     int header_len = 0;
     bool header_done = false;
     char filename[MAX_NAME_LEN] = {0};
 
-    char buf[FILE_BUF_SIZE];
+    char *buf = s_upload_buf;
     int remaining = req->content_len;
     int r = 0;
     while (!header_done && remaining > 0) {
         r = httpd_req_recv(req, buf, remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         if (r <= 0) {
             send_json_error(req, "400 Bad Request", "{\"error\":\"RECV_FAIL\"}");
             goto cleanup;
         }
         remaining -= r;
-        if (header_len + r >= (int)sizeof(header_buf)) {
-            send_json_error(req, "400 Bad Request", "{\"error\":\"HEADER_TOO_LARGE\"}");
-            goto cleanup;
+        if (header_len < (int)UPLOAD_HEADER_SIZE - 1) {
+            int to_copy = r;
+            int space = (int)UPLOAD_HEADER_SIZE - 1 - header_len;
+            if (to_copy > space) {
+                to_copy = space;
+            }
+            if (to_copy > 0) {
+                memcpy(header_buf + header_len, buf, to_copy);
+                header_len += to_copy;
+                header_buf[header_len] = '\0';
+            }
         }
-        memcpy(header_buf + header_len, buf, r);
-        header_len += r;
-        header_buf[header_len] = '\0';
-        char *header_end = strstr(header_buf, "\r\n\r\n");
+        size_t header_mark = 0;
+        char *header_end = find_header_end(header_buf, (size_t)header_len, &header_mark);
         if (header_end) {
             header_done = true;
             if (!extract_filename(header_buf, filename, sizeof(filename))) {
@@ -603,8 +664,18 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
             }
             struct stat st;
             if (stat(full_path, &st) == 0) {
-                send_json_error(req, "409 Conflict", "{\"error\":\"FILE_EXISTS\"}");
-                goto cleanup;
+                if (S_ISDIR(st.st_mode)) {
+                    send_json_error(req, "409 Conflict", "{\"error\":\"IS_DIRECTORY\"}");
+                    goto cleanup;
+                }
+                if (!overwrite) {
+                    send_json_error(req, "409 Conflict", "{\"error\":\"FILE_EXISTS\"}");
+                    goto cleanup;
+                }
+                if (unlink(full_path) != 0) {
+                    send_json_error(req, "500 Internal Server Error", "{\"error\":\"DELETE_FAIL\"}");
+                    goto cleanup;
+                }
             }
 
             char tmp_path[MAX_PATH_LEN];
@@ -623,10 +694,16 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
             char boundary_marker[80];
             snprintf(boundary_marker, sizeof(boundary_marker), "\r\n--%s", boundary);
             size_t marker_len = strlen(boundary_marker);
-            char tail[90];
+            if (marker_len + 1 > sizeof(s_upload_tail)) {
+                fclose(fp);
+                unlink(tmp_path);
+                send_json_error(req, "400 Bad Request", "{\"error\":\"BOUNDARY_TOO_LONG\"}");
+                goto cleanup;
+            }
+            char *tail = s_upload_tail;
             size_t tail_len = 0;
 
-            char *data_start = header_end + 4;
+            char *data_start = header_end + (header_mark ? header_mark : 4);
             int data_len = header_len - (int)(data_start - header_buf);
             if (data_len > 0) {
                 memcpy(buf, data_start, (size_t)data_len);
@@ -639,6 +716,11 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
             while (!done) {
                 if (r == 0 && remaining > 0) {
                     r = httpd_req_recv(req, buf, remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining);
+                    if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        r = 0;
+                        continue;
+                    }
                     if (r <= 0) {
                         fclose(fp);
                         unlink(tmp_path);
@@ -651,7 +733,7 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
                     break;
                 }
 
-                char work[FILE_BUF_SIZE + 90];
+                char *work = s_upload_work;
                 size_t work_len = 0;
                 if (tail_len > 0) {
                     memcpy(work, tail, tail_len);
@@ -693,6 +775,10 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
 
             while (remaining > 0) {
                 int d = httpd_req_recv(req, buf, remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining);
+                if (d == HTTPD_SOCK_ERR_TIMEOUT) {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
+                }
                 if (d <= 0) {
                     break;
                 }
@@ -711,7 +797,10 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
 
             httpd_resp_set_type(req, "application/json");
             httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-            result = ESP_OK;
+            goto cleanup;
+        }
+        if (!header_done && header_len >= (int)UPLOAD_HEADER_SIZE - 1) {
+            send_json_error(req, "400 Bad Request", "{\"error\":\"HEADER_TOO_LARGE\"}");
             goto cleanup;
         }
     }
@@ -726,33 +815,33 @@ cleanup:
 static esp_err_t http_fs_download(httpd_req_t *req)
 {
     if (!fs_gate(req)) {
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char rel_path[MAX_PATH_LEN];
     if (!get_query_path(req, rel_path, sizeof(rel_path))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
     if (strcmp(rel_path, "/") == 0) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char full_path[MAX_PATH_LEN];
     if (!build_fs_path(rel_path, full_path, sizeof(full_path))) {
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"PATH_FAIL\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     struct stat st;
     if (stat(full_path, &st) != 0) {
         send_json_error(req, "404 Not Found", "{\"error\":\"NOT_FOUND\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
     if (S_ISDIR(st.st_mode)) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"IS_DIRECTORY\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     const char *filename = strrchr(rel_path, '/');
@@ -766,7 +855,7 @@ static esp_err_t http_fs_download(httpd_req_t *req)
     FILE *fp = fopen(full_path, "rb");
     if (!fp) {
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"OPEN_FAIL\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char buf[FILE_BUF_SIZE];
@@ -774,7 +863,7 @@ static esp_err_t http_fs_download(httpd_req_t *req)
     while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
         if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) {
             fclose(fp);
-            return ESP_FAIL;
+            return ESP_OK;
         }
     }
     fclose(fp);
@@ -785,18 +874,18 @@ static esp_err_t http_fs_download(httpd_req_t *req)
 static esp_err_t http_fs_mkdir(httpd_req_t *req)
 {
     if (!fs_gate(req)) {
-        return ESP_FAIL;
+        return ESP_OK;
     }
     if (!fileop_try_lock(req)) {
         drain_body(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char body[MAX_BODY_LEN];
     if (!read_body(req, body, sizeof(body))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_BODY\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char path_raw[MAX_PATH_LEN] = "/";
@@ -805,35 +894,35 @@ static esp_err_t http_fs_mkdir(httpd_req_t *req)
     if (!json_get_string(body, "name", name_raw, sizeof(name_raw))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"NAME_REQUIRED\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char rel_dir[MAX_PATH_LEN];
     if (!normalize_path(path_raw, rel_dir, sizeof(rel_dir))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char name[MAX_NAME_LEN];
     if (!sanitize_name(name_raw, name, sizeof(name))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_NAME\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char rel_path[MAX_PATH_LEN];
     if (!build_rel_child(rel_dir, name, rel_path, sizeof(rel_path))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"PATH_TOO_LONG\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char full_path[MAX_PATH_LEN];
     if (!build_fs_path(rel_path, full_path, sizeof(full_path))) {
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"PATH_FAIL\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     if (mkdir(full_path, 0775) != 0) {
@@ -843,7 +932,7 @@ static esp_err_t http_fs_mkdir(httpd_req_t *req)
             send_json_error(req, "500 Internal Server Error", "{\"error\":\"MKDIR_FAIL\"}");
         }
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -855,57 +944,57 @@ static esp_err_t http_fs_mkdir(httpd_req_t *req)
 static esp_err_t http_fs_delete(httpd_req_t *req)
 {
     if (!fs_gate(req)) {
-        return ESP_FAIL;
+        return ESP_OK;
     }
     if (!fileop_try_lock(req)) {
         drain_body(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char body[MAX_BODY_LEN];
     if (!read_body(req, body, sizeof(body))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_BODY\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char path_raw[MAX_PATH_LEN] = {0};
     if (!json_get_string(body, "path", path_raw, sizeof(path_raw))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"PATH_REQUIRED\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char rel_path[MAX_PATH_LEN];
     if (!normalize_path(path_raw, rel_path, sizeof(rel_path)) || strcmp(rel_path, "/") == 0) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char full_path[MAX_PATH_LEN];
     if (!build_fs_path(rel_path, full_path, sizeof(full_path))) {
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"PATH_FAIL\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     struct stat st;
     if (stat(full_path, &st) != 0) {
         send_json_error(req, "404 Not Found", "{\"error\":\"NOT_FOUND\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
     if (S_ISDIR(st.st_mode)) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"IS_DIRECTORY\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     if (unlink(full_path) != 0) {
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"DELETE_FAIL\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -917,18 +1006,18 @@ static esp_err_t http_fs_delete(httpd_req_t *req)
 static esp_err_t http_fs_rename(httpd_req_t *req)
 {
     if (!fs_gate(req)) {
-        return ESP_FAIL;
+        return ESP_OK;
     }
     if (!fileop_try_lock(req)) {
         drain_body(req);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char body[MAX_BODY_LEN];
     if (!read_body(req, body, sizeof(body))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_BODY\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char path_raw[MAX_PATH_LEN] = {0};
@@ -936,26 +1025,26 @@ static esp_err_t http_fs_rename(httpd_req_t *req)
     if (!json_get_string(body, "path", path_raw, sizeof(path_raw))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"PATH_REQUIRED\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
     if (!json_get_string(body, "new_name", new_raw, sizeof(new_raw))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"NEW_NAME_REQUIRED\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char rel_old[MAX_PATH_LEN];
     if (!normalize_path(path_raw, rel_old, sizeof(rel_old)) || strcmp(rel_old, "/") == 0) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char new_name[MAX_NAME_LEN];
     if (!sanitize_name(new_raw, new_name, sizeof(new_name))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_NAME\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char dir_path[MAX_PATH_LEN];
@@ -972,7 +1061,7 @@ static esp_err_t http_fs_rename(httpd_req_t *req)
     if (!build_rel_child(dir_path, new_name, rel_new, sizeof(rel_new))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"PATH_TOO_LONG\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char full_old[MAX_PATH_LEN];
@@ -981,25 +1070,25 @@ static esp_err_t http_fs_rename(httpd_req_t *req)
         !build_fs_path(rel_new, full_new, sizeof(full_new))) {
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"PATH_FAIL\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     struct stat st;
     if (stat(full_old, &st) != 0) {
         send_json_error(req, "404 Not Found", "{\"error\":\"NOT_FOUND\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
     if (stat(full_new, &st) == 0) {
         send_json_error(req, "409 Conflict", "{\"error\":\"FILE_EXISTS\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     if (rename(full_old, full_new) != 0) {
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"RENAME_FAIL\"}");
         fileop_unlock();
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -1012,7 +1101,7 @@ static esp_err_t http_usb_detach(httpd_req_t *req)
 {
     if (web_fs_is_busy()) {
         send_json_error(req, "423 Locked", "{\"error\":\"FILEOP_IN_PROGRESS\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
     esp_err_t err = msc_detach();
     httpd_resp_set_type(req, "application/json");
@@ -1021,7 +1110,23 @@ static esp_err_t http_usb_detach(httpd_req_t *req)
         return ESP_OK;
     }
     httpd_resp_send(req, "{\"ok\":false,\"error\":\"DETACH_FAIL\"}", HTTPD_RESP_USE_STRLEN);
-    return ESP_FAIL;
+    return ESP_OK;
+}
+
+static esp_err_t http_usb_attach(httpd_req_t *req)
+{
+    if (web_fs_is_busy()) {
+        send_json_error(req, "423 Locked", "{\"error\":\"FILEOP_IN_PROGRESS\"}");
+        return ESP_OK;
+    }
+    esp_err_t err = msc_attach();
+    httpd_resp_set_type(req, "application/json");
+    if (err == ESP_OK) {
+        httpd_resp_send(req, "{\"ok\":true,\"mode\":\"ATTACHED\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    httpd_resp_send(req, "{\"ok\":false,\"error\":\"ATTACH_FAIL\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
 }
 
 esp_err_t web_fs_register_handlers(httpd_handle_t server)
@@ -1072,6 +1177,12 @@ esp_err_t web_fs_register_handlers(httpd_handle_t server)
         .handler = http_usb_detach,
         .user_ctx = NULL,
     };
+    httpd_uri_t usb_attach = {
+        .uri = "/api/usb/attach",
+        .method = HTTP_POST,
+        .handler = http_usb_attach,
+        .user_ctx = NULL,
+    };
 
     httpd_register_uri_handler(server, &list);
     httpd_register_uri_handler(server, &upload);
@@ -1080,5 +1191,6 @@ esp_err_t web_fs_register_handlers(httpd_handle_t server)
     httpd_register_uri_handler(server, &del_req);
     httpd_register_uri_handler(server, &rename_req);
     httpd_register_uri_handler(server, &usb_detach);
+    httpd_register_uri_handler(server, &usb_attach);
     return ESP_OK;
 }

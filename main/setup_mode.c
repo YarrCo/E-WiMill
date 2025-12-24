@@ -33,6 +33,7 @@ static bool s_active = false;
 static bool s_wifi_inited = false;
 static bool s_handlers_registered = false;
 static bool s_mdns_inited = false;
+static bool s_mdns_service_added = false;
 static bool s_sta_connecting = false;
 static bool s_sta_connected = false;
 static bool s_sta_task_running = false;
@@ -214,8 +215,15 @@ static esp_err_t setup_mdns_start(uint16_t port)
         return err;
     }
     mdns_instance_name_set("E-WiMill");
-    mdns_service_remove("_http", "_tcp");
+    if (s_mdns_service_added) {
+        if (mdns_service_remove("_http", "_tcp") == ESP_OK) {
+            s_mdns_service_added = false;
+        }
+    }
     err = mdns_service_add(NULL, "_http", "_tcp", port, NULL, 0);
+    if (err == ESP_OK) {
+        s_mdns_service_added = true;
+    }
     return err;
 }
 
@@ -700,8 +708,14 @@ static const char k_index_html[] =
     "gap:12px;flex-wrap:wrap;}"
     "#fsPath{font-weight:bold;}"
     ".actions button{margin-right:6px;}"
+    ".actions label{margin-right:6px;font-size:12px;}"
+    ".actions input[type=checkbox]{margin-right:4px;}"
     "#drop{border:2px dashed #999;padding:16px;text-align:center;margin-bottom:10px;}"
     "#drop.hover{border-color:#333;color:#333;}"
+    ".progress{width:100%;height:12px;background:#eee;border:1px solid #ccc;border-radius:6px;"
+    "overflow:hidden;display:none;margin:8px 0;}"
+    "#fsProgressBar{height:100%;width:0%;background:#2f7d32;transition:width .2s;}"
+    ".progress-text{font-size:12px;color:#555;}"
     "#fsTable{width:100%;border-collapse:collapse;}"
     "#fsTable th,#fsTable td{border-bottom:1px solid #ddd;padding:6px;text-align:left;}"
     "#fsTable tr.selected{background:#e6f0ff;}"
@@ -747,10 +761,14 @@ static const char k_index_html[] =
     "<button id=\"btnRename\" type=\"button\">Rename</button>"
     "<button id=\"btnDelete\" type=\"button\">Delete</button>"
     "<button id=\"btnDownload\" type=\"button\">Download</button>"
+    "<button id=\"btnAttach\" type=\"button\">USB Attach</button>"
+    "<label><input id=\"chkOverwrite\" type=\"checkbox\"/>Overwrite</label>"
     "<input id=\"fileInput\" type=\"file\" style=\"display:none\"/>"
     "</div>"
     "</div>"
     "<div id=\"drop\">Drop file here or click Upload</div>"
+    "<div id=\"fsProgress\" class=\"progress\"><div id=\"fsProgressBar\"></div></div>"
+    "<div id=\"fsProgressText\" class=\"progress-text\"></div>"
     "<div id=\"fsMsg\"></div>"
     "<table id=\"fsTable\"><thead><tr>"
     "<th>Type</th><th>Name</th><th>Size</th>"
@@ -779,8 +797,13 @@ static const char k_index_html[] =
     "const btnRename=document.getElementById('btnRename');"
     "const btnDelete=document.getElementById('btnDelete');"
     "const btnDownload=document.getElementById('btnDownload');"
+    "const btnAttach=document.getElementById('btnAttach');"
+    "const chkOverwrite=document.getElementById('chkOverwrite');"
     "const fileInput=document.getElementById('fileInput');"
     "const drop=document.getElementById('drop');"
+    "const fsProgress=document.getElementById('fsProgress');"
+    "const fsProgressBar=document.getElementById('fsProgressBar');"
+    "const fsProgressText=document.getElementById('fsProgressText');"
     "let filled=false;let redirected=(localStorage.getItem('mdns_redirected')==='1');"
     "let activeTab='setup';"
     "let currentPath='/';"
@@ -807,6 +830,8 @@ static const char k_index_html[] =
     "btnRename.disabled=!enabled||uploading||!selected;"
     "btnDelete.disabled=!enabled||uploading||!selected;"
     "btnDownload.disabled=!enabled||uploading||!selected||selected.type!=='file';"
+    "btnAttach.disabled=!enabled||uploading;"
+    "chkOverwrite.disabled=!enabled||uploading;"
     "}"
     "function updateFsGate(status){"
     "let reason='';"
@@ -817,6 +842,8 @@ static const char k_index_html[] =
     "btnDetach.style.display=status.usb_mode==='ATTACHED'?'inline-block':'none';"
     "setButtonsEnabled(false);}"
     "else{fsBusy.style.display='none';setButtonsEnabled(true);}"
+    "btnAttach.style.display=status.usb_mode==='ATTACHED'?'none':'inline-block';"
+    "btnAttach.disabled=(status.usb_mode==='ATTACHED')||uploading;"
     "}"
     "function renderBreadcrumb(path){"
     "fsPath.innerHTML='';"
@@ -844,6 +871,19 @@ static const char k_index_html[] =
     "selected=item;setButtonsEnabled(!fsBlockedReason);"
     "}"
     "function joinPath(base,name){return base==='/'?'/'+name:base+'/'+name;}"
+    "function fmtBytes(n){"
+    "if(n<1024){return n+' B';}"
+    "if(n<1024*1024){return (n/1024).toFixed(1)+' KB';}"
+    "if(n<1024*1024*1024){return (n/1024/1024).toFixed(1)+' MB';}"
+    "return (n/1024/1024/1024).toFixed(1)+' GB';}"
+    "function resetProgress(){fsProgress.style.display='none';"
+    "fsProgressBar.style.width='0%';fsProgressText.textContent='';}"
+    "function updateProgress(loaded,total,rate){"
+    "fsProgress.style.display='block';"
+    "const pct=total>0?Math.min(100,(loaded/total)*100):0;"
+    "fsProgressBar.style.width=pct.toFixed(1)+'%';"
+    "const speed=rate>0?(' '+fmtBytes(rate)+'/s'):'';"
+    "fsProgressText.textContent=fmtBytes(loaded)+' / '+fmtBytes(total)+' ('+pct.toFixed(1)+'%'+speed+')';}"
     "async function refreshFiles(){"
     "if(fsBlockedReason){setFsMsg(fsBlockedReason,true);return;}"
     "setFsMsg('',false);"
@@ -855,12 +895,27 @@ static const char k_index_html[] =
     "async function uploadFile(file){"
     "if(fsBlockedReason||uploading){return;}"
     "uploading=true;setButtonsEnabled(false);setFsMsg('Uploading...',false);"
+    "resetProgress();"
     "const fd=new FormData();fd.append('file',file,file.name);"
-    "const res=await fetch('/api/fs/upload?path='+encodeURIComponent(currentPath),{method:'POST',body:fd});"
-    "uploading=false;"
-    "if(!res.ok){let err='UPLOAD_FAIL';try{const j=await res.json();err=j.error||err;}catch(e){}"
-    "setFsMsg(err,true);setButtonsEnabled(!fsBlockedReason);return;}"
-    "setFsMsg('Done',false);refreshFiles();"
+    "const xhr=new XMLHttpRequest();"
+    "const start=performance.now();"
+    "xhr.upload.onprogress=(e)=>{"
+    "const total=e.lengthComputable?e.total:file.size;"
+    "const loaded=e.loaded;"
+    "const elapsed=(performance.now()-start)/1000;"
+    "const rate=elapsed>0?loaded/elapsed:0;"
+    "updateProgress(loaded,total,rate);};"
+    "xhr.onreadystatechange=()=>{if(xhr.readyState!==4){return;}"
+    "let ok=xhr.status>=200&&xhr.status<300;"
+    "if(ok){setFsMsg('Done',false);refreshFiles();}"
+    "else{let err='UPLOAD_FAIL';try{const j=JSON.parse(xhr.responseText);err=j.error||err;}catch(e){}"
+    "if(err==='FILE_EXISTS' && !(chkOverwrite&&chkOverwrite.checked)){err='FILE_EXISTS (enable Overwrite)';}"
+    "setFsMsg(err,true);}uploading=false;setButtonsEnabled(!fsBlockedReason);resetProgress();};"
+    "xhr.onerror=()=>{setFsMsg('UPLOAD_NET',true);uploading=false;setButtonsEnabled(!fsBlockedReason);resetProgress();};"
+    "xhr.onabort=()=>{setFsMsg('UPLOAD_ABORT',true);uploading=false;setButtonsEnabled(!fsBlockedReason);resetProgress();};"
+    "const ow=(chkOverwrite&&chkOverwrite.checked)?'1':'0';"
+    "xhr.open('POST','/api/fs/upload?path='+encodeURIComponent(currentPath)+'&overwrite='+ow,true);"
+    "xhr.send(fd);"
     "}"
     "btnUpload.onclick=()=>{fileInput.value='';fileInput.click();};"
     "fileInput.onchange=()=>{const f=fileInput.files[0];if(f){uploadFile(f);}};"
@@ -887,6 +942,8 @@ static const char k_index_html[] =
     "setFsMsg(err,true);}else{setFsMsg('Done',false);refreshFiles();}};"
     "btnDownload.onclick=()=>{if(!selected||selected.type!=='file'){return;}"
     "window.location='/api/fs/download?path='+encodeURIComponent(joinPath(currentPath,selected.name));};"
+    "btnAttach.onclick=async()=>{const res=await fetch('/api/usb/attach',{method:'POST'});"
+    "if(res.ok){setFsMsg('Attached',false);}else{setFsMsg('ATTACH_FAIL',true);}};"
     "btnDetach.onclick=async()=>{const res=await fetch('/api/usb/detach',{method:'POST'});"
     "if(res.ok){setFsMsg('Detached',false);setTimeout(refreshFiles,500);}else{setFsMsg('DETACH_FAIL',true);}};"
     "async function refreshStatus(){"
@@ -1062,6 +1119,7 @@ static esp_err_t setup_http_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = port;
     cfg.max_uri_handlers = 16;
+    cfg.stack_size = 8192;
 
     esp_err_t err = httpd_start(&s_http, &cfg);
     if (err != ESP_OK) {
