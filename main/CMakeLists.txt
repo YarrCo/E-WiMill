@@ -8,6 +8,7 @@ idf_component_register(
         "led_status.c"
         "msc.c"
         "setup_mode.c"
+        "web_fs.c"
     INCLUDE_DIRS
         "."
     REQUIRES

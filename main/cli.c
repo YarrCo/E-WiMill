@@ -15,6 +15,7 @@
 
 #include "msc.h"
 #include "sdcard.h"
+#include "web_fs.h"
 #include "wimill_pins.h"
 
 #define TAG "CLI"
@@ -91,6 +92,9 @@ static void print_prompt(void)
 static bool fileop_is_busy(void)
 {
     if (s_fileop_busy) {
+        return true;
+    }
+    if (web_fs_is_busy()) {
         return true;
     }
     if (!s_fileop_queue) {
