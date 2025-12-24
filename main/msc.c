@@ -240,6 +240,11 @@ esp_err_t msc_init(void)
 
 msc_state_t msc_get_state(void) { return s_state; }
 
+bool msc_is_host_connected(void)
+{
+    return s_usb_enabled && tud_mounted();
+}
+
 esp_err_t msc_attach(void)
 {
     if (s_state == MSC_STATE_USB_ATTACHED)

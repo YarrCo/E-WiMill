@@ -807,9 +807,10 @@ static esp_err_t http_status_get(httpd_req_t *req)
 
     const char *mode = s_active ? "SETUP" : "NORMAL";
     const char *boot_str = (boot_mode == WIFI_BOOT_STA) ? "STA" : "AP";
+    const char *usb_host = msc_is_host_connected() ? "connected" : "disconnected";
     snprintf(resp, sizeof(resp),
              "{\"mode\":\"%s\",\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\","
-             "\"uptime_s\":%u,\"last_sta_ip\":\"%s\",\"usb_mode\":\"%s\","
+             "\"uptime_s\":%u,\"last_sta_ip\":\"%s\",\"usb_mode\":\"%s\",\"usb_host\":\"%s\","
              "\"sd_mounted\":%s,\"sta_connected\":%s,\"sta_connecting\":%s,"
              "\"sta_ip\":\"%s\",\"sta_error\":\"%s\",\"ssid\":\"%s\",\"sta_psk\":\"%s\","
              "\"rssi\":%d,\"dev_name\":\"%s\",\"mdns_name\":\"%s\",\"web_port\":%u,"
@@ -820,6 +821,7 @@ static esp_err_t http_status_get(httpd_req_t *req)
              (unsigned)uptime_s,
              last_ip[0] ? last_ip : "0.0.0.0",
              usb_mode_str(),
+             usb_host,
              mounted ? "true" : "false",
              sta_conn ? "true" : "false",
              sta_connecting ? "true" : "false",
