@@ -64,7 +64,7 @@ static const char *desc_strings[] = {
     (const char[]){0x09, 0x04}, // 0: English (0x0409)
     "Espressif",                // 1: Manufacturer
     "WiMill Disk",              // 2: Product
-    "123456",                   // 3: Serial
+    "RAMDISK001",               // 3: Serial
 };
 // --- END DESCRIPTORS ---
 
@@ -91,6 +91,9 @@ static uint8_t *s_ramdisk = NULL;
 static size_t s_ramdisk_size = MSC_RAMDISK_SIZE;
 static bool s_ramdisk_ready = false;
 static bool s_usb_installed = false;
+static bool s_usb_connected = false;
+static bool s_media_present = false;
+static bool s_unit_attention = false;
 static msc_state_t s_state = MSC_STATE_USB_DETACHED;
 static sector_cache_t s_cache = {0};
 static read_ahead_cache_t s_read_ahead = {0};
@@ -117,6 +120,21 @@ static void write_le32(uint8_t *buf, size_t off, uint32_t val)
     buf[off + 1] = (uint8_t)((val >> 8) & 0xFF);
     buf[off + 2] = (uint8_t)((val >> 16) & 0xFF);
     buf[off + 3] = (uint8_t)((val >> 24) & 0xFF);
+}
+
+static void write_be32(uint8_t *buf, size_t off, uint32_t val)
+{
+    buf[off] = (uint8_t)((val >> 24) & 0xFF);
+    buf[off + 1] = (uint8_t)((val >> 16) & 0xFF);
+    buf[off + 2] = (uint8_t)((val >> 8) & 0xFF);
+    buf[off + 3] = (uint8_t)(val & 0xFF);
+}
+
+static void write_be24(uint8_t *buf, size_t off, uint32_t val)
+{
+    buf[off] = (uint8_t)((val >> 16) & 0xFF);
+    buf[off + 1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[off + 2] = (uint8_t)(val & 0xFF);
 }
 
 static void ramdisk_format(void)
@@ -164,15 +182,19 @@ static void ramdisk_format(void)
 
 static esp_err_t ramdisk_init(void)
 {
-    if (s_ramdisk_ready && s_ramdisk) {
+    if (s_ramdisk_ready && s_ramdisk)
+    {
         return ESP_OK;
     }
-    if (!s_ramdisk) {
+    if (!s_ramdisk)
+    {
         uint8_t *buf = heap_caps_malloc(s_ramdisk_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!buf) {
+        if (!buf)
+        {
             buf = heap_caps_malloc(s_ramdisk_size, MALLOC_CAP_DEFAULT);
         }
-        if (!buf) {
+        if (!buf)
+        {
             return ESP_ERR_NO_MEM;
         }
         s_ramdisk = buf;
@@ -191,15 +213,22 @@ static bool storage_ready(void)
 #endif
 }
 
+static bool media_ready(void)
+{
+    return s_media_present && storage_ready();
+}
+
 static esp_err_t msc_read_sectors(uint32_t lba, void *buffer, uint32_t count)
 {
 #if MSC_USE_RAMDISK
-    if (!s_ramdisk || !buffer) {
+    if (!s_ramdisk || !buffer)
+    {
         return ESP_ERR_INVALID_STATE;
     }
     size_t offset = (size_t)lba * s_block_size;
     size_t len = (size_t)count * s_block_size;
-    if (offset + len > s_ramdisk_size) {
+    if (offset + len > s_ramdisk_size)
+    {
         return ESP_ERR_INVALID_SIZE;
     }
     memcpy(buffer, s_ramdisk + offset, len);
@@ -212,12 +241,14 @@ static esp_err_t msc_read_sectors(uint32_t lba, void *buffer, uint32_t count)
 static esp_err_t msc_write_sectors(uint32_t lba, const void *buffer, uint32_t count)
 {
 #if MSC_USE_RAMDISK
-    if (!s_ramdisk || !buffer) {
+    if (!s_ramdisk || !buffer)
+    {
         return ESP_ERR_INVALID_STATE;
     }
     size_t offset = (size_t)lba * s_block_size;
     size_t len = (size_t)count * s_block_size;
-    if (offset + len > s_ramdisk_size) {
+    if (offset + len > s_ramdisk_size)
+    {
         return ESP_ERR_INVALID_SIZE;
     }
     memcpy(s_ramdisk + offset, buffer, len);
@@ -313,19 +344,19 @@ static esp_err_t msc_write_partial(uint32_t lba, uint32_t offset, const uint8_t 
 
 static esp_err_t msc_enable(void)
 {
-    // Инициализация карты
-    #if MSC_USE_RAMDISK
+// Инициализация карты
+#if MSC_USE_RAMDISK
     ESP_RETURN_ON_ERROR(ramdisk_init(), TAG, "ramdisk init failed");
     s_block_size = MSC_SECTOR_SIZE;
     s_block_count = (uint32_t)(s_ramdisk_size / s_block_size);
     s_card = NULL;
-    #else
+#else
     ESP_RETURN_ON_ERROR(sdcard_init_raw(&s_card), TAG, "sd init failed");
 
     // !!! ИСПРАВЛЕНИЕ 1: Корректный расчет размера !!!
     s_block_size = s_card->csd.sector_size;
     s_block_count = s_card->csd.capacity;
-    #endif
+#endif
 
     memset(&s_cache, 0, sizeof(s_cache));
     memset(&s_read_ahead, 0, sizeof(s_read_ahead));
@@ -365,7 +396,11 @@ static esp_err_t msc_enable(void)
         s_usb_installed = true;
     }
 
-    tud_connect();
+    if (!s_usb_connected)
+    {
+        tud_connect();
+        s_usb_connected = true;
+    }
 #if MSC_USE_RAMDISK
     ESP_LOGI(TAG, "MSC RAM disk ready: %u KB", (unsigned)(s_ramdisk_size / 1024));
 #endif
@@ -381,11 +416,7 @@ static void msc_disable(void)
     s_cache.valid = false;
     s_read_ahead.valid = false;
     unlock_io();
-
-    tud_disconnect();
-    // Даем время хосту понять отключение
-    vTaskDelay(pdMS_TO_TICKS(100));
-    s_card = NULL;
+    // Keep USB connected, only hide media.
 }
 
 esp_err_t msc_init(void)
@@ -397,6 +428,8 @@ esp_err_t msc_init(void)
         set_state(MSC_STATE_ERROR);
         return ret;
     }
+    s_media_present = true;
+    s_unit_attention = false;
     set_state(MSC_STATE_USB_ATTACHED);
     ESP_LOGI(TAG, "MSC initialized. Blocks: %lu", (unsigned long)s_block_count);
     return ESP_OK;
@@ -420,6 +453,8 @@ esp_err_t msc_attach(void)
     if (msc_enable() != ESP_OK)
         return ESP_FAIL;
 
+    s_media_present = true;
+    s_unit_attention = true;
     set_state(MSC_STATE_USB_ATTACHED);
     return ESP_OK;
 }
@@ -430,6 +465,8 @@ esp_err_t msc_detach(void)
         return ESP_OK;
 
     msc_disable();
+    s_media_present = false;
+    s_unit_attention = false;
     sdcard_set_mode(SDCARD_MODE_APP);
     vTaskDelay(pdMS_TO_TICKS(MSC_DETACH_DELAY_MS));
 
@@ -457,12 +494,26 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
     (void)lun;
+    if (!s_media_present) {
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+        return false;
+    }
+    if (s_unit_attention) {
+        tud_msc_set_sense(lun, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
+        s_unit_attention = false;
+        return false;
+    }
     return storage_ready();
 }
 
 void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size)
 {
     (void)lun;
+    if (!media_ready()) {
+        *block_count = 0;
+        *block_size = MSC_SECTOR_SIZE;
+        return;
+    }
     *block_count = s_block_count; // Берем исправленное значение
     *block_size = (uint16_t)s_block_size;
 }
@@ -470,6 +521,15 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
     (void)lun;
+    if (!s_media_present) {
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+        return -1;
+    }
+    if (s_unit_attention) {
+        tud_msc_set_sense(lun, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
+        s_unit_attention = false;
+        return -1;
+    }
     if (!storage_ready())
         return -1;
     lock_io();
@@ -551,6 +611,15 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
     (void)lun;
+    if (!s_media_present) {
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+        return -1;
+    }
+    if (s_unit_attention) {
+        tud_msc_set_sense(lun, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
+        s_unit_attention = false;
+        return -1;
+    }
     if (!storage_ready())
         return -1;
     lock_io();
@@ -602,8 +671,15 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
 
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, uint16_t bufsize)
 {
-    (void)buffer;
-    (void)bufsize;
+    if (!s_media_present) {
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+        return -1;
+    }
+    if (s_unit_attention) {
+        tud_msc_set_sense(lun, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
+        s_unit_attention = false;
+        return -1;
+    }
     switch (scsi_cmd[0])
     {
     case SCSI_CMD_PREVENT_ALLOW_MEDIUM_REMOVAL:
@@ -612,8 +688,48 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
         flush_cache_locked();
         unlock_io();
         return 0;
+    case SCSI_CMD_READ_FORMAT_CAPACITIES:
+        if (!media_ready()) {
+            tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+            return -1;
+        }
+        if (bufsize < 12) {
+            return -1;
+        }
+        memset(buffer, 0, 12);
+        // Capacity list length (8 bytes)
+        write_be32((uint8_t *)buffer, 0, 8);
+        // Number of blocks
+        write_be32((uint8_t *)buffer, 4, s_block_count);
+        // Descriptor type: formatted media
+        ((uint8_t *)buffer)[8] = 0x02;
+        // Block length (3 bytes)
+        write_be24((uint8_t *)buffer, 9, s_block_size);
+        return 12;
+    case SCSI_CMD_MODE_SENSE_6:
+        if (!media_ready()) {
+            tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+            return -1;
+        }
+        if (bufsize < 4) {
+            return -1;
+        }
+        memset(buffer, 0, 4);
+        ((uint8_t *)buffer)[0] = 3; // Mode data length
+        return 4;
+    case SCSI_CMD_MODE_SENSE_10:
+        if (!media_ready()) {
+            tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+            return -1;
+        }
+        if (bufsize < 8) {
+            return -1;
+        }
+        memset(buffer, 0, 8);
+        ((uint8_t *)buffer)[1] = 6; // Mode data length
+        return 8;
     case SCSI_CMD_TEST_UNIT_READY:
-        return storage_ready() ? 0 : -1;
+        return media_ready() ? 0 : -1;
     case SCSI_CMD_START_STOP_UNIT:
         return 0;
     default:
