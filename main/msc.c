@@ -26,6 +26,12 @@
 #define MSC_USE_RAMDISK 1
 #endif
 #define MSC_RAMDISK_SIZE (1024 * 1024)
+#ifndef SCSI_CMD_READ_FORMAT_CAPACITY
+#define SCSI_CMD_READ_FORMAT_CAPACITY 0x23
+#endif
+#ifndef SCSI_CMD_MODE_SENSE_10
+#define SCSI_CMD_MODE_SENSE_10 0x5A
+#endif
 
 // --- USB DESCRIPTORS (MANUAL) ---
 #define USB_VID 0x303A
@@ -94,6 +100,7 @@ static bool s_usb_installed = false;
 static bool s_usb_connected = false;
 static bool s_media_present = false;
 static bool s_unit_attention = false;
+static uint8_t s_maxlun = 1;
 static msc_state_t s_state = MSC_STATE_USB_DETACHED;
 static sector_cache_t s_cache = {0};
 static read_ahead_cache_t s_read_ahead = {0};
@@ -470,7 +477,11 @@ esp_err_t msc_detach(void)
 
     msc_disable();
     s_media_present = false;
-    s_unit_attention = false;
+    s_unit_attention = true;
+#if MSC_USE_RAMDISK
+    set_state(MSC_STATE_USB_DETACHED);
+    return ESP_OK;
+#endif
     sdcard_set_mode(SDCARD_MODE_APP);
     vTaskDelay(pdMS_TO_TICKS(MSC_DETACH_DELAY_MS));
 
@@ -485,7 +496,16 @@ esp_err_t msc_detach(void)
 
 // --- TinyUSB Callbacks ---
 
-uint8_t tud_msc_get_maxlun_cb(void) { return 0; }
+uint8_t tud_msc_get_maxlun_cb(void)
+{
+    static int s_logged = 0;
+    if (s_logged < 5) {
+        ESP_LOGI(TAG, "MSC GET_MAX_LUN (lun_count=%u)", (unsigned)s_maxlun);
+        s_logged++;
+    }
+    return s_maxlun;
+}
+
 
 void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4])
 {
@@ -498,13 +518,13 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
     (void)lun;
-    if (!s_media_present) {
-        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
-        return false;
-    }
     if (s_unit_attention) {
         tud_msc_set_sense(lun, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
         s_unit_attention = false;
+        return false;
+    }
+    if (!s_media_present) {
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
         return false;
     }
     return storage_ready();
@@ -692,7 +712,7 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
         flush_cache_locked();
         unlock_io();
         return 0;
-    case SCSI_CMD_READ_FORMAT_CAPACITIES:
+    case SCSI_CMD_READ_FORMAT_CAPACITY:
         if (!media_ready()) {
             tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
             return -1;
