@@ -442,6 +442,8 @@ esp_err_t msc_attach(void)
     if (s_state == MSC_STATE_USB_ATTACHED)
         return ESP_OK;
 
+    ESP_LOGI(TAG, "usb attach");
+
     // Сначала отмонтируем VFS, если занято
     if (sdcard_is_mounted())
     {
@@ -463,6 +465,8 @@ esp_err_t msc_detach(void)
 {
     if (s_state == MSC_STATE_USB_DETACHED)
         return ESP_OK;
+
+    ESP_LOGI(TAG, "usb detach");
 
     msc_disable();
     s_media_present = false;
