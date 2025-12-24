@@ -53,6 +53,11 @@ void app_main(void)
         ESP_LOGE(TAG, "Setup mode init failed: %s", esp_err_to_name(err));
     }
 
+    err = setup_mode_autostart();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Setup mode autostart failed: %s", esp_err_to_name(err));
+    }
+
     err = button_longpress_init(WIMILL_PIN_SETUP_BTN, 5000, 40, setup_button_cb, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Button init failed: %s", esp_err_to_name(err));

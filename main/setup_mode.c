@@ -35,6 +35,7 @@ static bool s_mdns_inited = false;
 static bool s_sta_connecting = false;
 static bool s_sta_connected = false;
 static bool s_sta_task_running = false;
+static bool s_sta_only_mode = false;
 static httpd_handle_t s_http = NULL;
 static uint16_t s_http_port = 0;
 static esp_netif_t *s_ap_netif = NULL;
@@ -56,6 +57,8 @@ static SemaphoreHandle_t s_state_mutex = NULL;
 static esp_err_t setup_http_start(void);
 static bool start_sta_connect_async(void);
 static void schedule_sta_connect(void);
+static esp_err_t setup_wifi_init_base(void);
+static esp_err_t setup_sta_only_start(void);
 
 static void cfg_lock(void)
 {
@@ -232,6 +235,10 @@ static void sta_connect_timeout_cb(void *arg)
     state_unlock();
 
     esp_wifi_disconnect();
+    if (s_sta_only_mode) {
+        led_status_set_wifi(false);
+        return;
+    }
     if (s_ap_cfg_valid) {
         esp_wifi_set_mode(WIFI_MODE_AP);
         esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
@@ -254,6 +261,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         state_unlock();
         if (s_sta_timer) {
             esp_timer_stop(s_sta_timer);
+        }
+        if (s_sta_only_mode) {
+            led_status_set_wifi(false);
+            return;
         }
         if (s_ap_cfg_valid) {
             esp_wifi_set_mode(WIFI_MODE_AP);
@@ -291,6 +302,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_cfg.last_sta_ip[sizeof(s_cfg.last_sta_ip) - 1] = '\0';
         config_save(&s_cfg);
         uint16_t port = s_cfg.web_port ? s_cfg.web_port : 8080;
+        bool boot_sta = (s_cfg.wifi_boot_mode == WIFI_BOOT_STA);
         cfg_unlock();
 
         update_mdns_name();
@@ -303,13 +315,19 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         }
         setup_http_start();
 
+        if (boot_sta) {
+            s_sta_only_mode = true;
+            s_active = false;
+        }
+
         esp_wifi_set_mode(WIFI_MODE_STA);
+        led_status_set_wifi(true);
         led_status_set_setup(false);
         return;
     }
 }
 
-static esp_err_t setup_wifi_start(void)
+static esp_err_t setup_wifi_init_base(void)
 {
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -321,10 +339,6 @@ static esp_err_t setup_wifi_start(void)
     }
 
     if (!s_wifi_inited) {
-        s_ap_netif = esp_netif_create_default_wifi_ap();
-        if (!s_ap_netif) {
-            return ESP_FAIL;
-        }
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         err = esp_wifi_init(&cfg);
         if (err != ESP_OK) {
@@ -337,6 +351,23 @@ static esp_err_t setup_wifi_start(void)
         esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
         esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
         s_handlers_registered = true;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t setup_wifi_start(void)
+{
+    esp_err_t err = setup_wifi_init_base();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (!s_ap_netif) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+        if (!s_ap_netif) {
+            return ESP_FAIL;
+        }
     }
 
     uint8_t mac[6] = {0};
@@ -382,6 +413,30 @@ static esp_err_t setup_wifi_start(void)
     cfg_unlock();
 
     ESP_LOGI(TAG, "AP started: SSID=%s PASS=%s IP=%s PORT=%u", s_ap_ssid, AP_PASS, s_ap_ip, port);
+    s_sta_only_mode = false;
+    led_status_set_wifi(true);
+    return ESP_OK;
+}
+
+static esp_err_t setup_sta_only_start(void)
+{
+    esp_err_t err = setup_wifi_init_base();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (!s_sta_netif) {
+        s_sta_netif = esp_netif_create_default_wifi_sta();
+        if (!s_sta_netif) {
+            return ESP_FAIL;
+        }
+    }
+
+    s_sta_only_mode = true;
+    led_status_set_wifi(false);
+    if (!start_sta_connect_async()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     return ESP_OK;
 }
 
@@ -415,18 +470,25 @@ static esp_err_t sta_connect_start(void)
     sta_cfg.sta.scan_method = WIFI_FAST_SCAN;
     sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_err_t err = esp_wifi_set_mode(s_sta_only_mode ? WIFI_MODE_STA : WIFI_MODE_APSTA);
     if (err != ESP_OK) {
         set_sta_error("mode");
         return err;
     }
-    if (s_ap_cfg_valid) {
+    if (!s_sta_only_mode && s_ap_cfg_valid) {
         esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
     }
     err = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
     if (err != ESP_OK) {
         set_sta_error("sta_cfg");
         return err;
+    }
+    if (s_sta_only_mode) {
+        esp_err_t start_err = esp_wifi_start();
+        if (start_err != ESP_OK && start_err != ESP_ERR_WIFI_CONN && start_err != ESP_ERR_INVALID_STATE) {
+            set_sta_error("start");
+            return start_err;
+        }
     }
     esp_wifi_disconnect();
     err = esp_wifi_connect();
@@ -499,6 +561,7 @@ static void apply_timer_cb(void *arg)
 
 static void schedule_sta_connect(void)
 {
+    s_sta_only_mode = false;
     if (!s_apply_timer) {
         const esp_timer_create_args_t args = {
             .callback = apply_timer_cb,
@@ -579,6 +642,21 @@ static bool apply_config_form(const char *body, char *err, size_t err_len)
             if (port > 0 && port < 65536) {
                 next.web_port = (uint16_t)port;
             }
+        } else if (strcmp(key, "wifi_boot") == 0) {
+            char mode[8] = {0};
+            size_t len = strlen(val);
+            if (len >= sizeof(mode)) {
+                len = sizeof(mode) - 1;
+            }
+            for (size_t i = 0; i < len; ++i) {
+                mode[i] = (char)tolower((unsigned char)val[i]);
+            }
+            mode[len] = '\0';
+            if (strcmp(mode, "sta") == 0) {
+                next.wifi_boot_mode = WIFI_BOOT_STA;
+            } else if (strcmp(mode, "ap") == 0) {
+                next.wifi_boot_mode = WIFI_BOOT_AP;
+            }
         }
     }
 
@@ -624,6 +702,10 @@ static const char k_index_html[] =
     "<label>STA PSK<br><input id=\"sta_psk\" name=\"sta_psk\" type=\"password\"/>"
     "<button id=\"togglePsk\" type=\"button\">Show</button></label><br><br>"
     "<label>Web port<br><input id=\"web_port\" name=\"web_port\" type=\"number\"/></label><br><br>"
+    "<label>Wi-Fi boot<br><select id=\"wifi_boot\" name=\"wifi_boot\">"
+    "<option value=\"ap\">AP (setup)</option>"
+    "<option value=\"sta\">STA (auto)</option>"
+    "</select></label><br><br>"
     "<button type=\"submit\">Apply</button>"
     "</form>"
     "<script>"
@@ -655,6 +737,7 @@ static const char k_index_html[] =
     "document.getElementById('sta_ssid').value=j.ssid||'';"
     "document.getElementById('web_port').value=j.web_port||'';"
     "document.getElementById('sta_psk').value=j.sta_psk||'';"
+    "document.getElementById('wifi_boot').value=(j.wifi_boot||'AP').toLowerCase();"
     "filled=true;"
     "}"
     "const mdns=j.mdns_name?('http://'+j.mdns_name+'.local'):'';"
@@ -687,12 +770,14 @@ static esp_err_t http_status_get(httpd_req_t *req)
     char psk[CONFIG_STA_PSK_LEN];
     char dev_name[CONFIG_DEV_NAME_LEN];
     uint16_t web_port = 8080;
+    uint8_t boot_mode = WIFI_BOOT_AP;
     cfg_lock();
     json_sanitize(last_ip, sizeof(last_ip), s_cfg.last_sta_ip);
     json_sanitize(ssid, sizeof(ssid), s_cfg.sta_ssid);
     json_sanitize(psk, sizeof(psk), s_cfg.sta_psk);
     json_sanitize(dev_name, sizeof(dev_name), s_cfg.dev_name);
     web_port = s_cfg.web_port ? s_cfg.web_port : 8080;
+    boot_mode = s_cfg.wifi_boot_mode;
     cfg_unlock();
 
     char sta_ip[16];
@@ -721,12 +806,14 @@ static esp_err_t http_status_get(httpd_req_t *req)
     }
 
     const char *mode = s_active ? "SETUP" : "NORMAL";
+    const char *boot_str = (boot_mode == WIFI_BOOT_STA) ? "STA" : "AP";
     snprintf(resp, sizeof(resp),
              "{\"mode\":\"%s\",\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\","
              "\"uptime_s\":%u,\"last_sta_ip\":\"%s\",\"usb_mode\":\"%s\","
              "\"sd_mounted\":%s,\"sta_connected\":%s,\"sta_connecting\":%s,"
              "\"sta_ip\":\"%s\",\"sta_error\":\"%s\",\"ssid\":\"%s\",\"sta_psk\":\"%s\","
-             "\"rssi\":%d,\"dev_name\":\"%s\",\"mdns_name\":\"%s\",\"web_port\":%u}",
+             "\"rssi\":%d,\"dev_name\":\"%s\",\"mdns_name\":\"%s\",\"web_port\":%u,"
+             "\"wifi_boot\":\"%s\"}",
              mode,
              s_active ? s_ap_ssid : "",
              s_active ? s_ap_ip : "",
@@ -743,7 +830,8 @@ static esp_err_t http_status_get(httpd_req_t *req)
              rssi,
              dev_name,
              mdns_name,
-             (unsigned)web_port);
+             (unsigned)web_port,
+             boot_str);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
@@ -776,12 +864,6 @@ static esp_err_t http_config_post(httpd_req_t *req)
     cfg_lock();
     has_ssid = (s_cfg.sta_ssid[0] != '\0');
     cfg_unlock();
-    if (ok && !has_ssid) {
-        ok = false;
-        strncpy(err, "ssid_empty", sizeof(err));
-        err[sizeof(err) - 1] = '\0';
-    }
-
     httpd_resp_set_type(req, "application/json");
     if (ok) {
         httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -876,6 +958,7 @@ esp_err_t setup_mode_start(void)
         return ESP_OK;
     }
 
+    s_sta_only_mode = false;
     esp_err_t err = setup_wifi_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi AP start failed: %s", esp_err_to_name(err));
@@ -890,6 +973,34 @@ esp_err_t setup_mode_start(void)
     led_status_set_setup(true);
     s_active = true;
     ESP_LOGI(TAG, "SETUP_MODE active");
+    return ESP_OK;
+}
+
+esp_err_t setup_mode_autostart(void)
+{
+    if (s_active) {
+        return ESP_OK;
+    }
+
+    uint8_t boot_mode = WIFI_BOOT_AP;
+    bool has_ssid = false;
+    cfg_lock();
+    boot_mode = s_cfg.wifi_boot_mode;
+    has_ssid = (s_cfg.sta_ssid[0] != '\0');
+    cfg_unlock();
+
+    if (boot_mode == WIFI_BOOT_AP) {
+        return setup_mode_start();
+    }
+
+    if (boot_mode == WIFI_BOOT_STA) {
+        if (!has_ssid) {
+            led_status_set_wifi(false);
+            return ESP_OK;
+        }
+        return setup_sta_only_start();
+    }
+
     return ESP_OK;
 }
 

@@ -9,12 +9,18 @@
 #define CONFIG_STA_PSK_LEN 65
 #define CONFIG_LAST_IP_LEN 16
 
+typedef enum {
+    WIFI_BOOT_AP = 0,
+    WIFI_BOOT_STA = 1,
+} wifi_boot_mode_t;
+
 typedef struct {
     char dev_name[CONFIG_DEV_NAME_LEN];
     char sta_ssid[CONFIG_STA_SSID_LEN];
     char sta_psk[CONFIG_STA_PSK_LEN];
     uint16_t web_port;
     char last_sta_ip[CONFIG_LAST_IP_LEN];
+    uint8_t wifi_boot_mode;
 } wimill_config_t;
 
 void config_load_defaults(wimill_config_t *cfg);

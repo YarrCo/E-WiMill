@@ -6,4 +6,5 @@
 
 esp_err_t setup_mode_init(void);
 esp_err_t setup_mode_start(void);
+esp_err_t setup_mode_autostart(void);
 bool setup_mode_is_active(void);

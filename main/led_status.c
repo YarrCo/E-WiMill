@@ -15,6 +15,7 @@ static led_state_t s_state = LED_STATE_BOOT;
 static TaskHandle_t s_led_task = NULL;
 static bool s_setup_active = false;
 static bool s_setup_entry_pending = false;
+static bool s_wifi_disconnected = false;
 
 static void set_color(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -106,6 +107,10 @@ static void led_task(void *arg)
             setup_breathe();
             continue;
         }
+        if (s_wifi_disconnected) {
+            blink_pattern(96, 0, 24, 200, 800);
+            continue;
+        }
         switch (s_state) {
         case LED_STATE_BOOT:
             blink_pattern(0, 64, 0, 50, 500);
@@ -123,6 +128,9 @@ static void led_task(void *arg)
             break;
         case LED_STATE_QUEUE_WAIT:
             blink_pattern(48, 0, 48, 150, 500);
+            break;
+        case LED_STATE_WIFI_DISCONNECTED:
+            blink_pattern(96, 0, 24, 200, 800);
             break;
         default:
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -173,4 +181,9 @@ void led_status_set_setup(bool active)
         s_setup_entry_pending = false;
         set_color(0, 0, 0);
     }
+}
+
+void led_status_set_wifi(bool connected)
+{
+    s_wifi_disconnected = !connected;
 }
