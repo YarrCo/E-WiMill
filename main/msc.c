@@ -7,6 +7,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
@@ -21,6 +22,10 @@
 #define MSC_SECTOR_SIZE 512
 #define MSC_DETACH_DELAY_MS 500
 #define MSC_READAHEAD_SECTORS 8
+#ifndef MSC_USE_RAMDISK
+#define MSC_USE_RAMDISK 1
+#endif
+#define MSC_RAMDISK_SIZE (1024 * 1024)
 
 // --- USB DESCRIPTORS (MANUAL) ---
 #define USB_VID 0x303A
@@ -82,6 +87,9 @@ typedef struct
 static sdmmc_card_t *s_card = NULL;
 static uint32_t s_block_size = MSC_SECTOR_SIZE;
 static uint32_t s_block_count = 0;
+static uint8_t *s_ramdisk = NULL;
+static size_t s_ramdisk_size = MSC_RAMDISK_SIZE;
+static bool s_ramdisk_ready = false;
 static bool s_usb_installed = false;
 static msc_state_t s_state = MSC_STATE_USB_DETACHED;
 static sector_cache_t s_cache = {0};
@@ -95,6 +103,128 @@ static inline void lock_io(void)
 static inline void unlock_io(void)
 {
     sdcard_unlock();
+}
+
+static void write_le16(uint8_t *buf, size_t off, uint16_t val)
+{
+    buf[off] = (uint8_t)(val & 0xFF);
+    buf[off + 1] = (uint8_t)((val >> 8) & 0xFF);
+}
+
+static void write_le32(uint8_t *buf, size_t off, uint32_t val)
+{
+    buf[off] = (uint8_t)(val & 0xFF);
+    buf[off + 1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[off + 2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[off + 3] = (uint8_t)((val >> 24) & 0xFF);
+}
+
+static void ramdisk_format(void)
+{
+    memset(s_ramdisk, 0, s_ramdisk_size);
+    uint8_t *bs = s_ramdisk;
+    bs[0] = 0xEB;
+    bs[1] = 0x3C;
+    bs[2] = 0x90;
+    memcpy(&bs[3], "MSDOS5.0", 8);
+    write_le16(bs, 0x0B, 512);
+    bs[0x0D] = 1;
+    write_le16(bs, 0x0E, 1);
+    bs[0x10] = 2;
+    write_le16(bs, 0x11, 128);
+    write_le16(bs, 0x13, (uint16_t)(s_ramdisk_size / 512));
+    bs[0x15] = 0xF8;
+    write_le16(bs, 0x16, 6);
+    write_le16(bs, 0x18, 32);
+    write_le16(bs, 0x1A, 64);
+    write_le32(bs, 0x1C, 0);
+    write_le32(bs, 0x20, 0);
+    bs[0x24] = 0x80;
+    bs[0x25] = 0x00;
+    bs[0x26] = 0x29;
+    write_le32(bs, 0x27, 0x1234ABCD);
+    memcpy(&bs[0x2B], "RAMDISK   ", 11);
+    memcpy(&bs[0x36], "FAT12   ", 8);
+    bs[0x1FE] = 0x55;
+    bs[0x1FF] = 0xAA;
+
+    size_t fat1_off = 1 * 512;
+    size_t fat2_off = (1 + 6) * 512;
+    s_ramdisk[fat1_off + 0] = 0xF8;
+    s_ramdisk[fat1_off + 1] = 0xFF;
+    s_ramdisk[fat1_off + 2] = 0xFF;
+    s_ramdisk[fat2_off + 0] = 0xF8;
+    s_ramdisk[fat2_off + 1] = 0xFF;
+    s_ramdisk[fat2_off + 2] = 0xFF;
+
+    size_t root_off = (1 + 6 + 6) * 512;
+    memcpy(&s_ramdisk[root_off], "RAMDISK   ", 11);
+    s_ramdisk[root_off + 11] = 0x08;
+}
+
+static esp_err_t ramdisk_init(void)
+{
+    if (s_ramdisk_ready && s_ramdisk) {
+        return ESP_OK;
+    }
+    if (!s_ramdisk) {
+        uint8_t *buf = heap_caps_malloc(s_ramdisk_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) {
+            buf = heap_caps_malloc(s_ramdisk_size, MALLOC_CAP_DEFAULT);
+        }
+        if (!buf) {
+            return ESP_ERR_NO_MEM;
+        }
+        s_ramdisk = buf;
+    }
+    ramdisk_format();
+    s_ramdisk_ready = true;
+    return ESP_OK;
+}
+
+static bool storage_ready(void)
+{
+#if MSC_USE_RAMDISK
+    return s_ramdisk_ready && s_ramdisk;
+#else
+    return s_card != NULL;
+#endif
+}
+
+static esp_err_t msc_read_sectors(uint32_t lba, void *buffer, uint32_t count)
+{
+#if MSC_USE_RAMDISK
+    if (!s_ramdisk || !buffer) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    size_t offset = (size_t)lba * s_block_size;
+    size_t len = (size_t)count * s_block_size;
+    if (offset + len > s_ramdisk_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(buffer, s_ramdisk + offset, len);
+    return ESP_OK;
+#else
+    return sdmmc_read_sectors(s_card, buffer, lba, count);
+#endif
+}
+
+static esp_err_t msc_write_sectors(uint32_t lba, const void *buffer, uint32_t count)
+{
+#if MSC_USE_RAMDISK
+    if (!s_ramdisk || !buffer) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    size_t offset = (size_t)lba * s_block_size;
+    size_t len = (size_t)count * s_block_size;
+    if (offset + len > s_ramdisk_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(s_ramdisk + offset, buffer, len);
+    return ESP_OK;
+#else
+    return sdmmc_write_sectors(s_card, buffer, lba, count);
+#endif
 }
 
 static void set_state(msc_state_t st)
@@ -120,7 +250,7 @@ static esp_err_t flush_cache_locked(void)
 {
     if (!s_cache.valid || !s_cache.dirty)
         return ESP_OK;
-    esp_err_t ret = sdmmc_write_sectors(s_card, s_cache.data, s_cache.lba, 1);
+    esp_err_t ret = msc_write_sectors(s_cache.lba, s_cache.data, 1);
     if (ret == ESP_OK)
     {
         s_cache.dirty = false;
@@ -139,7 +269,7 @@ static esp_err_t load_cache_locked(uint32_t lba)
     if (s_cache.valid && s_cache.lba == lba)
         return ESP_OK;
     ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
-    esp_err_t ret = sdmmc_read_sectors(s_card, s_cache.data, lba, 1);
+    esp_err_t ret = msc_read_sectors(lba, s_cache.data, 1);
     if (ret != ESP_OK)
         return ret;
     s_cache.valid = true;
@@ -150,7 +280,7 @@ static esp_err_t load_cache_locked(uint32_t lba)
 
 static esp_err_t msc_read_partial(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
-    if (!s_card)
+    if (!storage_ready())
         return ESP_ERR_INVALID_STATE;
     if ((offset + bufsize) > s_block_size)
         return ESP_ERR_INVALID_ARG;
@@ -161,7 +291,7 @@ static esp_err_t msc_read_partial(uint32_t lba, uint32_t offset, uint8_t *buffer
 
 static esp_err_t msc_write_partial(uint32_t lba, uint32_t offset, const uint8_t *buffer, uint32_t bufsize)
 {
-    if (!s_card)
+    if (!storage_ready())
         return ESP_ERR_INVALID_STATE;
     if ((offset + bufsize) > s_block_size)
         return ESP_ERR_INVALID_ARG;
@@ -184,11 +314,18 @@ static esp_err_t msc_write_partial(uint32_t lba, uint32_t offset, const uint8_t 
 static esp_err_t msc_enable(void)
 {
     // Инициализация карты
+    #if MSC_USE_RAMDISK
+    ESP_RETURN_ON_ERROR(ramdisk_init(), TAG, "ramdisk init failed");
+    s_block_size = MSC_SECTOR_SIZE;
+    s_block_count = (uint32_t)(s_ramdisk_size / s_block_size);
+    s_card = NULL;
+    #else
     ESP_RETURN_ON_ERROR(sdcard_init_raw(&s_card), TAG, "sd init failed");
 
     // !!! ИСПРАВЛЕНИЕ 1: Корректный расчет размера !!!
     s_block_size = s_card->csd.sector_size;
-    s_block_count = s_card->csd.capacity; // Без умножения!
+    s_block_count = s_card->csd.capacity;
+    #endif
 
     memset(&s_cache, 0, sizeof(s_cache));
     memset(&s_read_ahead, 0, sizeof(s_read_ahead));
@@ -229,6 +366,9 @@ static esp_err_t msc_enable(void)
     }
 
     tud_connect();
+#if MSC_USE_RAMDISK
+    ESP_LOGI(TAG, "MSC RAM disk ready: %u KB", (unsigned)(s_ramdisk_size / 1024));
+#endif
     return ESP_OK;
 }
 
@@ -317,7 +457,7 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
     (void)lun;
-    return (s_card != NULL);
+    return storage_ready();
 }
 
 void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size)
@@ -330,7 +470,7 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
     (void)lun;
-    if (!s_card)
+    if (!storage_ready())
         return -1;
     lock_io();
     esp_err_t ret = ESP_OK;
@@ -377,7 +517,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
                     }
                     else
                     {
-                        ret = sdmmc_read_sectors(s_card, s_read_ahead.data, lba, ra_sectors);
+                        ret = msc_read_sectors(lba, s_read_ahead.data, ra_sectors);
                         if (ret == ESP_OK)
                         {
                             s_read_ahead.valid = true;
@@ -389,7 +529,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
                 }
                 else
                 {
-                    ret = sdmmc_read_sectors(s_card, buffer, lba, sectors);
+                    ret = msc_read_sectors(lba, buffer, sectors);
                 }
             }
         }
@@ -411,7 +551,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
     (void)lun;
-    if (!s_card)
+    if (!storage_ready())
         return -1;
     lock_io();
     esp_err_t ret = ESP_OK;
@@ -434,7 +574,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
             if (lba < ra_end && write_end > s_read_ahead.lba)
                 s_read_ahead.valid = false;
         }
-        ret = sdmmc_write_sectors(s_card, buffer, lba, sectors);
+        ret = msc_write_sectors(lba, buffer, sectors);
     }
     else
     {
@@ -473,7 +613,7 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
         unlock_io();
         return 0;
     case SCSI_CMD_TEST_UNIT_READY:
-        return s_card ? 0 : -1;
+        return storage_ready() ? 0 : -1;
     case SCSI_CMD_START_STOP_UNIT:
         return 0;
     default:
