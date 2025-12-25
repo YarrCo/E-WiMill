@@ -79,7 +79,7 @@ void cli_print_help(void)
     printf("  cat <name>          - show first %d bytes (hex+ascii)\n", CLI_DEFAULT_CAT_BYTES);
     printf("  touch <name> <n>    - create file with n zero bytes (queued)\n");
     printf("  sdtest [mb] [kHz] [buf N] - write+verify file (queued)\n");
-    printf("  sd freq [kHz]       - show/set SD SPI freq (20000/26000)\n");
+    printf("  sd freq [kHz]       - show/set SD SPI freq (20000..40000)\n");
     printf("  usb status|attach|detach  - manage MSC state\n");
 }
 
@@ -336,7 +336,7 @@ static void handle_touch(const char *name, const char *size_str)
 static void handle_sd_freq(int argc, char *argv[])
 {
     if (argc < 2 || strcmp(argv[1], "freq") != 0) {
-        ESP_LOGW(TAG, "Usage: sd freq [20000|26000]");
+        ESP_LOGW(TAG, "Usage: sd freq [20000..40000]");
         return;
     }
     if (msc_get_state() == MSC_STATE_USB_ATTACHED) {

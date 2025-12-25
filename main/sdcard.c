@@ -40,9 +40,7 @@ static sdcard_mode_t s_mode = SDCARD_MODE_USB;
 
 static bool is_supported_freq(uint32_t khz)
 {
-    return khz == WIMILL_SD_FREQ_KHZ_DEFAULT ||
-           khz == WIMILL_SD_FREQ_KHZ_20MHZ ||
-           khz == WIMILL_SD_FREQ_KHZ_26MHZ;
+    return khz >= WIMILL_SD_FREQ_KHZ_MIN && khz <= WIMILL_SD_FREQ_KHZ_MAX;
 }
 
 static bool ensure_mutex(void)
