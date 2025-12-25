@@ -62,50 +62,49 @@ static void schedule_sta_connect(void);
 static esp_err_t setup_wifi_init_base(void);
 static esp_err_t setup_sta_only_start(void);
 
+// --- HELPER FUNCTIONS ---
+
 static void cfg_lock(void)
 {
-    if (s_cfg_mutex) {
+    if (s_cfg_mutex)
         xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
-    }
 }
 
 static void cfg_unlock(void)
 {
-    if (s_cfg_mutex) {
+    if (s_cfg_mutex)
         xSemaphoreGive(s_cfg_mutex);
-    }
 }
 
 static void state_lock(void)
 {
-    if (s_state_mutex) {
+    if (s_state_mutex)
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    }
 }
 
 static void state_unlock(void)
 {
-    if (s_state_mutex) {
+    if (s_state_mutex)
         xSemaphoreGive(s_state_mutex);
-    }
 }
 
 static void json_sanitize(char *dst, size_t dst_len, const char *src)
 {
     size_t di = 0;
-    if (!dst || dst_len == 0) {
+    if (!dst || dst_len == 0)
         return;
-    }
-    if (!src) {
+    if (!src)
+    {
         dst[0] = '\0';
         return;
     }
-    for (size_t si = 0; src[si] != '\0' && di + 1 < dst_len; ++si) {
+    for (size_t si = 0; src[si] != '\0' && di + 1 < dst_len; ++si)
+    {
         unsigned char ch = (unsigned char)src[si];
-        if (ch < 32) {
+        if (ch < 32)
             continue;
-        }
-        if (ch == '"' || ch == '\\') {
+        if (ch == '"' || ch == '\\')
+        {
             dst[di++] = '_';
             continue;
         }
@@ -117,10 +116,13 @@ static void json_sanitize(char *dst, size_t dst_len, const char *src)
 static void set_sta_error(const char *msg)
 {
     state_lock();
-    if (msg) {
+    if (msg)
+    {
         strncpy(s_sta_error, msg, sizeof(s_sta_error));
         s_sta_error[sizeof(s_sta_error) - 1] = '\0';
-    } else {
+    }
+    else
+    {
         s_sta_error[0] = '\0';
     }
     state_unlock();
@@ -129,12 +131,12 @@ static void set_sta_error(const char *msg)
 static const char *usb_mode_str(void)
 {
     msc_state_t st = msc_get_state();
-    switch (st) {
+    switch (st)
+    {
     case MSC_STATE_USB_ATTACHED:
         return "ATTACHED";
     case MSC_STATE_USB_DETACHED:
         return "DETACHED";
-    case MSC_STATE_ERROR:
     default:
         return "ERROR";
     }
@@ -144,49 +146,42 @@ static void sanitize_dev_name(const char *src, char *out, size_t out_len, const 
 {
     size_t di = 0;
     bool last_dash = false;
-
-    if (!out || out_len == 0) {
+    if (!out || out_len == 0)
         return;
-    }
-
-    for (size_t si = 0; src && src[si] != '\0' && di + 1 < out_len && di < MDNS_NAME_LIMIT; ++si) {
+    for (size_t si = 0; src && src[si] != '\0' && di + 1 < out_len && di < MDNS_NAME_LIMIT; ++si)
+    {
         char ch = (char)tolower((unsigned char)src[si]);
-        if (ch == ' ' || ch == '_') {
+        if (ch == ' ' || ch == '_')
             ch = '-';
-        }
-        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-')) {
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-'))
             continue;
-        }
-        if (ch == '-') {
-            if (di == 0 || last_dash) {
+        if (ch == '-')
+        {
+            if (di == 0 || last_dash)
                 continue;
-            }
             last_dash = true;
-        } else {
+        }
+        else
+        {
             last_dash = false;
         }
         out[di++] = ch;
     }
-    if (di > 0 && out[di - 1] == '-') {
+    if (di > 0 && out[di - 1] == '-')
         di--;
-    }
     out[di] = '\0';
-
-    if (di == 0) {
+    if (di == 0)
         snprintf(out, out_len, "ewimill-%02x%02x", mac[4], mac[5]);
-    }
 }
 
 static void update_mdns_name(void)
 {
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-
     char name[32];
     cfg_lock();
     sanitize_dev_name(s_cfg.dev_name, name, sizeof(name), mac);
     cfg_unlock();
-
     state_lock();
     strncpy(s_mdns_name, name, sizeof(s_mdns_name));
     s_mdns_name[sizeof(s_mdns_name) - 1] = '\0';
@@ -196,36 +191,31 @@ static void update_mdns_name(void)
 static esp_err_t setup_mdns_start(uint16_t port)
 {
     esp_err_t err = ESP_OK;
-    if (!s_mdns_inited) {
+    if (!s_mdns_inited)
+    {
         err = mdns_init();
-        if (err != ESP_OK) {
+        if (err != ESP_OK)
             return err;
-        }
         s_mdns_inited = true;
     }
-
     state_lock();
     char host[32];
     strncpy(host, s_mdns_name, sizeof(host));
     host[sizeof(host) - 1] = '\0';
     state_unlock();
-
     err = mdns_hostname_set(host);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
         return err;
-    }
     mdns_instance_name_set("E-WiMill");
-    if (s_mdns_service_added) {
-        if (mdns_service_remove("_http", "_tcp") == ESP_OK) {
-            s_mdns_service_added = false;
-        }
-    }
+    if (s_mdns_service_added)
+        mdns_service_remove("_http", "_tcp");
     err = mdns_service_add(NULL, "_http", "_tcp", port, NULL, 0);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
         s_mdns_service_added = true;
-    }
     return err;
 }
+
+// --- WIFI LOGIC ---
 
 static void sta_connect_timeout_cb(void *arg)
 {
@@ -233,22 +223,20 @@ static void sta_connect_timeout_cb(void *arg)
     state_lock();
     bool connected = s_sta_connected;
     state_unlock();
-
-    if (connected) {
+    if (connected)
         return;
-    }
-
     set_sta_error("timeout");
     state_lock();
     s_sta_connecting = false;
     state_unlock();
-
     esp_wifi_disconnect();
-    if (s_sta_only_mode) {
+    if (s_sta_only_mode)
+    {
         led_status_set_wifi(false);
         return;
     }
-    if (s_ap_cfg_valid) {
+    if (s_ap_cfg_valid)
+    {
         esp_wifi_set_mode(WIFI_MODE_AP);
         esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
     }
@@ -258,7 +246,8 @@ static void sta_connect_timeout_cb(void *arg)
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
         char err[32];
         snprintf(err, sizeof(err), "reason:%d", (int)disc->reason);
@@ -268,25 +257,26 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_sta_connecting = false;
         strncpy(s_sta_ip, "0.0.0.0", sizeof(s_sta_ip));
         state_unlock();
-        if (s_sta_timer) {
+        if (s_sta_timer)
             esp_timer_stop(s_sta_timer);
-        }
-        if (s_sta_only_mode) {
+        if (s_sta_only_mode)
+        {
             led_status_set_wifi(false);
             return;
         }
-        if (s_ap_cfg_valid) {
+        if (s_ap_cfg_valid)
+        {
             esp_wifi_set_mode(WIFI_MODE_AP);
             esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
         }
         led_status_set_setup(true);
         return;
     }
-    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)event_data;
         char ip_str[16];
         esp_ip4addr_ntoa(&evt->ip_info.ip, ip_str, sizeof(ip_str));
-
         state_lock();
         strncpy(s_sta_ip, ip_str, sizeof(s_sta_ip));
         s_sta_ip[sizeof(s_sta_ip) - 1] = '\0';
@@ -294,18 +284,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_sta_connecting = false;
         s_sta_error[0] = '\0';
         state_unlock();
-
         wifi_ap_record_t ap_info;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+        {
             state_lock();
             s_sta_rssi = ap_info.rssi;
             state_unlock();
         }
-
-        if (s_sta_timer) {
+        if (s_sta_timer)
             esp_timer_stop(s_sta_timer);
-        }
-
         cfg_lock();
         strncpy(s_cfg.last_sta_ip, ip_str, sizeof(s_cfg.last_sta_ip));
         s_cfg.last_sta_ip[sizeof(s_cfg.last_sta_ip) - 1] = '\0';
@@ -313,22 +300,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         uint16_t port = s_cfg.web_port ? s_cfg.web_port : 8080;
         bool boot_sta = (s_cfg.wifi_boot_mode == WIFI_BOOT_STA);
         cfg_unlock();
-
         update_mdns_name();
         setup_mdns_start(port);
-
-        if (s_http && port != s_http_port) {
+        if (s_http && port != s_http_port)
+        {
             httpd_stop(s_http);
             s_http = NULL;
             s_http_port = 0;
         }
         setup_http_start();
-
-        if (boot_sta) {
+        if (boot_sta)
+        {
             s_sta_only_mode = true;
             s_active = false;
         }
-
         esp_wifi_set_mode(WIFI_MODE_STA);
         led_status_set_wifi(true);
         led_status_set_setup(false);
@@ -339,50 +324,42 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 static esp_err_t setup_wifi_init_base(void)
 {
     esp_err_t err = esp_netif_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
         return err;
-    }
     err = esp_event_loop_create_default();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
         return err;
-    }
-
-    if (!s_wifi_inited) {
+    if (!s_wifi_inited)
+    {
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         err = esp_wifi_init(&cfg);
-        if (err != ESP_OK) {
+        if (err != ESP_OK)
             return err;
-        }
         s_wifi_inited = true;
     }
-
-    if (!s_handlers_registered) {
+    if (!s_handlers_registered)
+    {
         esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
         esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
         s_handlers_registered = true;
     }
-
     return ESP_OK;
 }
 
 static esp_err_t setup_wifi_start(void)
 {
     esp_err_t err = setup_wifi_init_base();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
         return err;
-    }
-
-    if (!s_ap_netif) {
+    if (!s_ap_netif)
+    {
         s_ap_netif = esp_netif_create_default_wifi_ap();
-        if (!s_ap_netif) {
+        if (!s_ap_netif)
             return ESP_FAIL;
-        }
     }
-
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "E-WiMill-%02X%02X", mac[4], mac[5]);
-
     memset(&s_ap_cfg, 0, sizeof(s_ap_cfg));
     strncpy((char *)s_ap_cfg.ap.ssid, s_ap_ssid, sizeof(s_ap_cfg.ap.ssid));
     s_ap_cfg.ap.ssid_len = strlen(s_ap_ssid);
@@ -390,37 +367,31 @@ static esp_err_t setup_wifi_start(void)
     s_ap_cfg.ap.max_connection = 4;
     s_ap_cfg.ap.channel = 1;
     s_ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
-
-    if (strlen(AP_PASS) == 0) {
+    if (strlen(AP_PASS) == 0)
         s_ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
-    }
     s_ap_cfg_valid = true;
-
     err = esp_wifi_set_mode(WIFI_MODE_AP);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
         return err;
-    }
     err = esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
         return err;
-    }
     err = esp_wifi_start();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
         return err;
-    }
-
     esp_netif_ip_info_t ip;
-    if (s_ap_netif && esp_netif_get_ip_info(s_ap_netif, &ip) == ESP_OK) {
+    if (s_ap_netif && esp_netif_get_ip_info(s_ap_netif, &ip) == ESP_OK)
+    {
         esp_ip4addr_ntoa(&ip.ip, s_ap_ip, sizeof(s_ap_ip));
-    } else {
+    }
+    else
+    {
         strncpy(s_ap_ip, "192.168.4.1", sizeof(s_ap_ip));
         s_ap_ip[sizeof(s_ap_ip) - 1] = '\0';
     }
-
     cfg_lock();
     uint16_t port = s_cfg.web_port ? s_cfg.web_port : 8080;
     cfg_unlock();
-
     ESP_LOGI(TAG, "AP started: SSID=%s PASS=%s IP=%s PORT=%u", s_ap_ssid, AP_PASS, s_ap_ip, port);
     s_sta_only_mode = false;
     led_status_set_wifi(true);
@@ -430,22 +401,18 @@ static esp_err_t setup_wifi_start(void)
 static esp_err_t setup_sta_only_start(void)
 {
     esp_err_t err = setup_wifi_init_base();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
         return err;
-    }
-
-    if (!s_sta_netif) {
+    if (!s_sta_netif)
+    {
         s_sta_netif = esp_netif_create_default_wifi_sta();
-        if (!s_sta_netif) {
+        if (!s_sta_netif)
             return ESP_FAIL;
-        }
     }
-
     s_sta_only_mode = true;
     led_status_set_wifi(false);
-    if (!start_sta_connect_async()) {
+    if (!start_sta_connect_async())
         return ESP_ERR_INVALID_STATE;
-    }
     return ESP_OK;
 }
 
@@ -459,53 +426,40 @@ static esp_err_t sta_connect_start(void)
     strncpy(psk, s_cfg.sta_psk, sizeof(psk));
     psk[sizeof(psk) - 1] = '\0';
     cfg_unlock();
-
-    if (ssid[0] == '\0') {
+    if (ssid[0] == '\0')
+    {
         set_sta_error("ssid_empty");
         return ESP_ERR_INVALID_ARG;
     }
-
-    if (!s_sta_netif) {
+    if (!s_sta_netif)
+    {
         s_sta_netif = esp_netif_create_default_wifi_sta();
-        if (!s_sta_netif) {
-            set_sta_error("sta_netif");
+        if (!s_sta_netif)
             return ESP_FAIL;
-        }
     }
-
     wifi_config_t sta_cfg = {0};
     strncpy((char *)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid));
     strncpy((char *)sta_cfg.sta.password, psk, sizeof(sta_cfg.sta.password));
     sta_cfg.sta.scan_method = WIFI_FAST_SCAN;
     sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-
     esp_err_t err = esp_wifi_set_mode(s_sta_only_mode ? WIFI_MODE_STA : WIFI_MODE_APSTA);
-    if (err != ESP_OK) {
-        set_sta_error("mode");
+    if (err != ESP_OK)
         return err;
-    }
-    if (!s_sta_only_mode && s_ap_cfg_valid) {
+    if (!s_sta_only_mode && s_ap_cfg_valid)
         esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
-    }
     err = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
-    if (err != ESP_OK) {
-        set_sta_error("sta_cfg");
+    if (err != ESP_OK)
         return err;
-    }
-    if (s_sta_only_mode) {
+    if (s_sta_only_mode)
+    {
         esp_err_t start_err = esp_wifi_start();
-        if (start_err != ESP_OK && start_err != ESP_ERR_WIFI_CONN && start_err != ESP_ERR_INVALID_STATE) {
-            set_sta_error("start");
+        if (start_err != ESP_OK && start_err != ESP_ERR_WIFI_CONN && start_err != ESP_ERR_INVALID_STATE)
             return start_err;
-        }
     }
     esp_wifi_disconnect();
     err = esp_wifi_connect();
-    if (err != ESP_OK) {
-        set_sta_error("connect");
+    if (err != ESP_OK)
         return err;
-    }
-
     state_lock();
     s_sta_connecting = true;
     s_sta_connected = false;
@@ -513,23 +467,16 @@ static esp_err_t sta_connect_start(void)
     s_sta_error[0] = '\0';
     s_sta_rssi = 0;
     state_unlock();
-
-    if (!s_sta_timer) {
-        const esp_timer_create_args_t args = {
-            .callback = sta_connect_timeout_cb,
-            .arg = NULL,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "sta_timeout",
-            .skip_unhandled_events = true,
-        };
+    if (!s_sta_timer)
+    {
+        const esp_timer_create_args_t args = {.callback = sta_connect_timeout_cb, .name = "sta_timeout", .skip_unhandled_events = true};
         esp_timer_create(&args, &s_sta_timer);
     }
-    if (s_sta_timer) {
+    if (s_sta_timer)
+    {
         esp_timer_stop(s_sta_timer);
         esp_timer_start_once(s_sta_timer, (uint64_t)STA_CONNECT_TIMEOUT_MS * 1000ULL);
     }
-
-    ESP_LOGI(TAG, "STA connect started: ssid=%s", ssid);
     return ESP_OK;
 }
 
@@ -546,14 +493,15 @@ static void sta_connect_task(void *arg)
 static bool start_sta_connect_async(void)
 {
     state_lock();
-    if (s_sta_task_running || s_sta_connecting) {
+    if (s_sta_task_running || s_sta_connecting)
+    {
         state_unlock();
         return false;
     }
     s_sta_task_running = true;
     state_unlock();
-
-    if (xTaskCreate(sta_connect_task, "sta_connect", 4096, NULL, 6, NULL) != pdPASS) {
+    if (xTaskCreate(sta_connect_task, "sta_connect", 4096, NULL, 6, NULL) != pdPASS)
+    {
         state_lock();
         s_sta_task_running = false;
         state_unlock();
@@ -571,17 +519,10 @@ static void apply_timer_cb(void *arg)
 static void schedule_sta_connect(void)
 {
     s_sta_only_mode = false;
-    if (!s_apply_timer) {
-        const esp_timer_create_args_t args = {
-            .callback = apply_timer_cb,
-            .arg = NULL,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "sta_apply",
-            .skip_unhandled_events = true,
-        };
-        if (esp_timer_create(&args, &s_apply_timer) != ESP_OK) {
-            return;
-        }
+    if (!s_apply_timer)
+    {
+        const esp_timer_create_args_t args = {.callback = apply_timer_cb, .name = "sta_apply", .skip_unhandled_events = true};
+        esp_timer_create(&args, &s_apply_timer);
     }
     esp_timer_stop(s_apply_timer);
     esp_timer_start_once(s_apply_timer, 200 * 1000ULL);
@@ -589,18 +530,23 @@ static void schedule_sta_connect(void)
 
 static void url_decode(char *dst, size_t dst_len, const char *src)
 {
-    size_t di = 0;
-    size_t si = 0;
-    while (src[si] && di + 1 < dst_len) {
+    size_t di = 0, si = 0;
+    while (src[si] && di + 1 < dst_len)
+    {
         char ch = src[si];
-        if (ch == '%' && isxdigit((unsigned char)src[si + 1]) && isxdigit((unsigned char)src[si + 2])) {
+        if (ch == '%' && isxdigit((unsigned char)src[si + 1]) && isxdigit((unsigned char)src[si + 2]))
+        {
             char hex[3] = {src[si + 1], src[si + 2], '\0'};
             dst[di++] = (char)strtol(hex, NULL, 16);
             si += 3;
-        } else if (ch == '+') {
+        }
+        else if (ch == '+')
+        {
             dst[di++] = ' ';
             si++;
-        } else {
+        }
+        else
+        {
             dst[di++] = ch;
             si++;
         }
@@ -612,371 +558,228 @@ static bool apply_config_form(const char *body, char *err, size_t err_len)
 {
     bool ok = true;
     char *tmp = strdup(body);
-    if (!tmp) {
-        if (err) {
-            strncpy(err, "no_mem", err_len);
-            err[err_len - 1] = '\0';
-        }
+    if (!tmp)
         return false;
-    }
-
     wimill_config_t next;
     cfg_lock();
     next = s_cfg;
     cfg_unlock();
-
     char *saveptr = NULL;
-    for (char *pair = strtok_r(tmp, "&", &saveptr); pair; pair = strtok_r(NULL, "&", &saveptr)) {
+    for (char *pair = strtok_r(tmp, "&", &saveptr); pair; pair = strtok_r(NULL, "&", &saveptr))
+    {
         char *eq = strchr(pair, '=');
-        if (!eq) {
+        if (!eq)
             continue;
-        }
         *eq = '\0';
-        char key[32] = {0};
-        char val[96] = {0};
+        char key[32] = {0}, val[96] = {0};
         url_decode(key, sizeof(key), pair);
         url_decode(val, sizeof(val), eq + 1);
-
-        if (strcmp(key, "device_name") == 0) {
+        if (strcmp(key, "device_name") == 0)
             strncpy(next.dev_name, val, sizeof(next.dev_name));
-            next.dev_name[sizeof(next.dev_name) - 1] = '\0';
-        } else if (strcmp(key, "sta_ssid") == 0) {
+        else if (strcmp(key, "sta_ssid") == 0)
             strncpy(next.sta_ssid, val, sizeof(next.sta_ssid));
-            next.sta_ssid[sizeof(next.sta_ssid) - 1] = '\0';
-        } else if (strcmp(key, "sta_psk") == 0) {
+        else if (strcmp(key, "sta_psk") == 0)
             strncpy(next.sta_psk, val, sizeof(next.sta_psk));
-            next.sta_psk[sizeof(next.sta_psk) - 1] = '\0';
-        } else if (strcmp(key, "web_port") == 0) {
+        else if (strcmp(key, "web_port") == 0)
+        {
             int port = atoi(val);
-            if (port > 0 && port < 65536) {
+            if (port > 0 && port < 65536)
                 next.web_port = (uint16_t)port;
-            }
-        } else if (strcmp(key, "wifi_boot") == 0) {
-            char mode[8] = {0};
-            size_t len = strlen(val);
-            if (len >= sizeof(mode)) {
-                len = sizeof(mode) - 1;
-            }
-            for (size_t i = 0; i < len; ++i) {
-                mode[i] = (char)tolower((unsigned char)val[i]);
-            }
-            mode[len] = '\0';
-            if (strcmp(mode, "sta") == 0) {
+        }
+        else if (strcmp(key, "wifi_boot") == 0)
+        {
+            if (strcmp(val, "sta") == 0)
                 next.wifi_boot_mode = WIFI_BOOT_STA;
-            } else if (strcmp(mode, "ap") == 0) {
+            else
                 next.wifi_boot_mode = WIFI_BOOT_AP;
-            }
         }
     }
-
-    if (config_save(&next) == ESP_OK) {
+    if (config_save(&next) == ESP_OK)
+    {
         cfg_lock();
         s_cfg = next;
         cfg_unlock();
         update_mdns_name();
-    } else {
+    }
+    else
+    {
         ok = false;
-        if (err) {
+        if (err)
             strncpy(err, "save_failed", err_len);
-            err[err_len - 1] = '\0';
-        }
     }
-
     free(tmp);
-
-    if (!ok) {
-        return false;
-    }
-
     return ok;
 }
 
+// --- HTML & RESOURCES (NEON CNC THEME) ---
+
 static const char k_index_html[] =
-    "<!doctype html><html><head><meta charset=\"utf-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-    "<title>E-WiMill Setup</title>"
-    "<style>"
-    "body{font-family:Arial,sans-serif;margin:20px;color:#111;}"
-    ".tabs{display:flex;gap:8px;margin-bottom:14px;}"
-    ".tab{padding:8px 12px;border:1px solid #ccc;background:#f6f6f6;cursor:pointer;}"
-    ".tab.active{background:#111;color:#fff;border-color:#111;}"
-    ".view{display:none;}"
-    ".view.active{display:block;}"
-    "pre{background:#f2f2f2;padding:10px;overflow:auto;}"
-    ".row{margin-bottom:12px;}#msg{margin:12px 0;color:#0b5;}#err{color:#c00;margin:6px 0;}"
-    ".files-header{display:flex;align-items:center;justify-content:space-between;margin:10px 0;"
-    "gap:12px;flex-wrap:wrap;}"
-    "#fsPath{font-weight:bold;}"
-    ".actions button{margin-right:6px;}"
-    ".actions label{margin-right:6px;font-size:12px;}"
-    ".actions input[type=checkbox]{margin-right:4px;}"
-    "#drop{border:2px dashed #999;padding:16px;text-align:center;margin-bottom:10px;}"
-    "#drop.hover{border-color:#333;color:#333;}"
-    ".progress{width:100%;height:12px;background:#eee;border:1px solid #ccc;border-radius:6px;"
-    "overflow:hidden;display:none;margin:8px 0;}"
-    "#fsProgressBar{height:100%;width:0%;background:#2f7d32;transition:width .2s;}"
-    ".progress-text{font-size:12px;color:#555;}"
-    "#fsTable{width:100%;border-collapse:collapse;}"
-    "#fsTable th,#fsTable td{border-bottom:1px solid #ddd;padding:6px;text-align:left;}"
-    "#fsTable tr.selected{background:#e6f0ff;}"
-    ".banner{background:#b00020;color:#fff;padding:10px;margin:10px 0;display:none;}"
-    ".banner button{margin-left:10px;}"
-    ".crumb{cursor:pointer;color:#1155cc;text-decoration:underline;margin-right:4px;}"
-    ".crumb-sep{margin-right:4px;}"
-    "</style>"
-    "</head><body>"
-    "<h1>E-WiMill Setup</h1>"
-    "<div class=\"tabs\">"
-    "<button id=\"tabSetup\" class=\"tab active\" type=\"button\">Setup</button>"
-    "<button id=\"tabFiles\" class=\"tab\" type=\"button\">Files</button>"
-    "</div>"
+    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+    "<title>NEON CNC CONTROL</title><style>"
+    ":root{--bg:#050510;--grid:rgba(0,255,255,0.1);--cyan:#00f3ff;--pink:#ff00ff;"
+    "--red:#ff3333;--green:#33ff33;--glass:rgba(0,20,40,0.7);}"
+    "body{margin:0;padding:20px;background-color:var(--bg);background-image:"
+    "linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);"
+    "background-size:30px 30px;color:var(--cyan);font-family:'Courier New',monospace;font-weight:bold;"
+    "min-height:100vh;box-sizing:border-box;overflow-x:hidden;}"
+    "body::after{content:\"\";position:fixed;top:0;left:0;width:100vw;height:100vh;background:"
+    "repeating-linear-gradient(0deg,rgba(0,0,0,0.15),rgba(0,0,0,0.15) 1px,transparent 1px,transparent 2px);"
+    "pointer-events:none;z-index:999;}"
+    ".container{max-width:800px;margin:0 auto;border:2px solid var(--cyan);box-shadow:0 0 15px var(--cyan),"
+    "inset 0 0 20px rgba(0,243,255,0.2);background:var(--glass);backdrop-filter:blur(5px);padding:20px;"
+    "border-radius:4px;position:relative;}"
+    "header{display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid var(--cyan);"
+    "padding-bottom:15px;margin-bottom:20px;}h1{margin:0;text-transform:uppercase;letter-spacing:4px;"
+    "text-shadow:2px 2px 0px var(--pink);font-size:1.5rem;}"
+    ".sys-status{font-size:0.9rem;text-align:right;}.status-badge{display:inline-block;padding:2px 8px;"
+    "background:#000;border:1px solid currentColor;}"
+    ".status-ok{color:var(--green);box-shadow:0 0 5px var(--green);}"
+    ".status-warn{color:var(--red);box-shadow:0 0 5px var(--red);animation:blink 1s infinite;}"
+    ".tabs{display:flex;gap:10px;margin-bottom:20px;}.tab-btn{flex:1;background:transparent;border:1px solid var(--cyan);"
+    "color:var(--cyan);padding:10px;cursor:pointer;text-transform:uppercase;font-family:inherit;font-weight:bold;"
+    "transition:0.2s;box-shadow:0 0 5px var(--cyan);}.tab-btn:hover{background:rgba(0,243,255,0.1);"
+    "transform:translateY(-2px);}.tab-btn.active{background:var(--cyan);color:#000;box-shadow:0 0 15px var(--cyan);}"
+    ".view{display:none;}.view.active{display:block;}"
+    ".diag-table{width:100%;border-collapse:collapse;margin-top:10px;}"
+    ".diag-table td,.diag-table th{border:1px solid var(--cyan);padding:8px;text-align:left;}"
+    ".diag-table th{background:rgba(0,243,255,0.2);text-transform:uppercase;}.val-ok{color:var(--green);}"
+    ".val-num{color:var(--pink);}.val-err{color:var(--red);}"
+    ".cfg-box{padding:15px;border:1px solid var(--grid);margin-top:15px;}"
+    ".cfg-input{background:black;border:1px solid var(--cyan);color:var(--cyan);font-family:inherit;"
+    "padding:5px;width:100%;box-sizing:border-box;margin-bottom:10px;}"
+    ".toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:15px;padding:10px;border:1px dashed var(--cyan);}"
+    ".toolbar.disabled{opacity:0.3;pointer-events:none;}"
+    ".btn{background:#000;border:1px solid var(--pink);color:var(--pink);padding:8px 16px;cursor:pointer;"
+    "text-transform:uppercase;font-family:inherit;font-size:0.8rem;transition:0.2s;}"
+    ".btn:hover{background:var(--pink);color:#000;box-shadow:0 0 10px var(--pink);}"
+    ".btn-green{border-color:var(--green);color:var(--green);}.btn-green:hover{background:var(--green);"
+    "color:#000;box-shadow:0 0 10px var(--green);}"
+    "#dropZone{border:2px dashed var(--cyan);padding:30px;text-align:center;margin-bottom:20px;"
+    "color:rgba(0,243,255,0.5);transition:0.3s;cursor:pointer;}"
+    "#dropZone.hover{background:rgba(0,243,255,0.1);color:var(--cyan);border-style:solid;box-shadow:inset 0 0 20px var(--cyan);}"
+    ".progress-container{border:1px solid var(--cyan);height:20px;margin-bottom:20px;background:#000;"
+    "position:relative;display:none;}"
+    ".progress-bar{height:100%;width:0%;background:repeating-linear-gradient(45deg,var(--pink),var(--pink) 10px,"
+    "#d600d6 10px,#d600d6 20px);box-shadow:0 0 10px var(--pink);transition:width 0.2s linear;}"
+    ".progress-text{position:absolute;width:100%;text-align:center;top:0;line-height:20px;color:#fff;"
+    "text-shadow:1px 1px 0 #000;font-size:0.8rem;}"
+    ".file-list{width:100%;border-collapse:collapse;}.file-list th{text-align:left;border-bottom:2px solid var(--cyan);"
+    "padding:5px;}.file-list td{padding:8px 5px;border-bottom:1px solid rgba(0,243,255,0.3);cursor:pointer;}"
+    ".file-list tr:hover{background:var(--cyan);color:#000;}.file-list tr.selected{background:rgba(0,243,255,0.3);}"
+    ".banner-warn{display:none;border:2px solid var(--red);padding:15px;background:rgba(50,0,0,0.5);color:var(--red);"
+    "text-align:center;box-shadow:0 0 15px var(--red);margin-bottom:15px;animation:blink 1s infinite alternate;}"
+    "@keyframes blink{from{opacity:1;}to{opacity:0.7;}}"
+    "</style></head><body>"
+    "<div class=\"container\">"
+    "<header><h1>WiMill <span style=\"color:var(--pink)\">//</span> CNC</h1>"
+    "<div class=\"sys-status\">SYSTEM: <span id=\"stSys\" class=\"status-badge\">...</span><br>"
+    "USB LINK: <span id=\"stUsb\" class=\"status-badge\">...</span></div></header>"
+    "<div class=\"tabs\"><button id=\"tabSetup\" class=\"tab-btn active\" onclick=\"setTab('setup')\">SYSTEM</button>"
+    "<button id=\"tabFiles\" class=\"tab-btn\" onclick=\"setTab('files')\">STORAGE</button></div>"
     "<div id=\"setupView\" class=\"view active\">"
-    "<h3>Status</h3><pre id=\"status\">loading...</pre>"
-    "<div id=\"msg\"></div><div id=\"err\"></div>"
-    "<div class=\"row\"><button id=\"openBtn\" type=\"button\">Open</button></div>"
-    "<h3>Config</h3>"
-    "<form id=\"cfg\">"
-    "<label>Device name<br><input id=\"device_name\" name=\"device_name\"/></label><br><br>"
-    "<label>STA SSID<br><input id=\"sta_ssid\" name=\"sta_ssid\"/></label><br><br>"
-    "<label>STA PSK<br><input id=\"sta_psk\" name=\"sta_psk\" type=\"password\"/>"
-    "<button id=\"togglePsk\" type=\"button\">Show</button></label><br><br>"
-    "<label>Web port<br><input id=\"web_port\" name=\"web_port\" type=\"number\"/></label><br><br>"
-    "<label>Wi-Fi boot<br><select id=\"wifi_boot\" name=\"wifi_boot\">"
-    "<option value=\"ap\">AP (setup)</option>"
-    "<option value=\"sta\">STA (auto)</option>"
-    "</select></label><br><br>"
-    "<button type=\"submit\">Apply</button>"
-    "</form>"
-    "</div>"
+    "<h3 style=\"border-bottom:1px solid var(--pink);display:inline-block;\">DIAGNOSTICS</h3>"
+    "<table class=\"diag-table\">"
+    "<tr><th>Parameter</th><th>Value</th></tr>"
+    "<tr><td>Device Name</td><td id=\"valDevName\" class=\"val-num\">-</td></tr>"
+    "<tr><td>Wi-Fi SSID</td><td id=\"valSsid\" class=\"val-ok\">-</td></tr>"
+    "<tr><td>IP Address</td><td id=\"valIp\" class=\"val-num\">-</td></tr>"
+    "<tr><td>Last Known IP</td><td id=\"valLastIp\" class=\"val-num\">-</td></tr>"
+    "<tr><td>Signal (RSSI)</td><td id=\"valRssi\" class=\"val-num\">-</td></tr>"
+    "<tr><td>Uptime</td><td id=\"valUptime\" class=\"val-num\">-</td></tr>"
+    "<tr><td>SD Card</td><td id=\"valSd\" class=\"val-ok\">-</td></tr>"
+    "</table><br>"
+    "<h3 style=\"border-bottom:1px solid var(--pink);display:inline-block;\">CONFIGURATION</h3>"
+    "<form id=\"cfgForm\" class=\"cfg-box\">"
+    "<label>DEVICE NAME</label><input id=\"device_name\" name=\"device_name\" class=\"cfg-input\">"
+    "<label>STA SSID</label><input id=\"sta_ssid\" name=\"sta_ssid\" class=\"cfg-input\">"
+    "<label>STA PASSWORD</label><input id=\"sta_psk\" name=\"sta_psk\" type=\"password\" class=\"cfg-input\">"
+    "<label>WEB PORT</label><input id=\"web_port\" name=\"web_port\" type=\"number\" class=\"cfg-input\">"
+    "<label>WIFI BOOT MODE</label><select id=\"wifi_boot\" name=\"wifi_boot\" class=\"cfg-input\" style=\"background:black;\">"
+    "<option value=\"sta\">STA (AUTO CONNECT)</option><option value=\"ap\">AP (SETUP MODE)</option></select>"
+    "<button type=\"submit\" class=\"btn btn-green\">APPLY SETTINGS</button><div id=\"saveMsg\"></div>"
+    "</form></div>"
     "<div id=\"filesView\" class=\"view\">"
-    "<div id=\"fsBusy\" class=\"banner\"><span id=\"fsBusyText\">BUSY: USB Mass Storage attached. "
-    "Detach USB to manage files.</span>"
-    "<button id=\"btnDetach\" type=\"button\">USB Detach</button>"
-    "</div>"
-    "<div class=\"files-header\">"
-    "<div id=\"fsPath\">/sdcard</div>"
-    "<div class=\"actions\">"
-    "<button id=\"btnUpload\" type=\"button\">Upload</button>"
-    "<button id=\"btnMkdir\" type=\"button\">New Folder</button>"
-    "<button id=\"btnRename\" type=\"button\">Rename</button>"
-    "<button id=\"btnDelete\" type=\"button\">Delete</button>"
-    "<button id=\"btnDownload\" type=\"button\">Download</button>"
-    "<button id=\"btnAttach\" type=\"button\">USB Attach</button>"
-    "<label><input id=\"chkOverwrite\" type=\"checkbox\"/>Overwrite</label>"
-    "<input id=\"fileInput\" type=\"file\" style=\"display:none\"/>"
-    "</div>"
-    "</div>"
-    "<div id=\"drop\">Drop file here or click Upload</div>"
-    "<div id=\"fsProgress\" class=\"progress\"><div id=\"fsProgressBar\"></div></div>"
-    "<div id=\"fsProgressText\" class=\"progress-text\"></div>"
-    "<div id=\"fsMsg\"></div>"
-    "<table id=\"fsTable\"><thead><tr>"
-    "<th>Type</th><th>Name</th><th>Size</th>"
-    "</tr></thead><tbody></tbody></table>"
-    "</div>"
-    "<script>"
-    "const statusEl=document.getElementById('status');"
-    "const msgEl=document.getElementById('msg');"
-    "const errEl=document.getElementById('err');"
-    "const openBtn=document.getElementById('openBtn');"
-    "const form=document.getElementById('cfg');"
-    "const togglePsk=document.getElementById('togglePsk');"
-    "const tabSetup=document.getElementById('tabSetup');"
-    "const tabFiles=document.getElementById('tabFiles');"
-    "const setupView=document.getElementById('setupView');"
-    "const filesView=document.getElementById('filesView');"
-    "const fsBusy=document.getElementById('fsBusy');"
-    "const fsBusyText=document.getElementById('fsBusyText');"
-    "const btnDetach=document.getElementById('btnDetach');"
-    "const fsPath=document.getElementById('fsPath');"
-    "const fsMsg=document.getElementById('fsMsg');"
-    "const fsTable=document.getElementById('fsTable');"
-    "const fsBody=fsTable.querySelector('tbody');"
-    "const btnUpload=document.getElementById('btnUpload');"
-    "const btnMkdir=document.getElementById('btnMkdir');"
-    "const btnRename=document.getElementById('btnRename');"
-    "const btnDelete=document.getElementById('btnDelete');"
-    "const btnDownload=document.getElementById('btnDownload');"
-    "const btnAttach=document.getElementById('btnAttach');"
-    "const chkOverwrite=document.getElementById('chkOverwrite');"
-    "const fileInput=document.getElementById('fileInput');"
-    "const drop=document.getElementById('drop');"
-    "const fsProgress=document.getElementById('fsProgress');"
-    "const fsProgressBar=document.getElementById('fsProgressBar');"
-    "const fsProgressText=document.getElementById('fsProgressText');"
-    "let filled=false;let redirected=(localStorage.getItem('mdns_redirected')==='1');"
-    "let activeTab='setup';"
-    "let currentPath='/';"
-    "let selected=null;"
-    "let uploading=false;"
-    "let fsBlockedReason='';"
-    "openBtn.onclick=()=>{if(openBtn.dataset.url){window.location=openBtn.dataset.url;}};"
-    "togglePsk.onclick=()=>{const p=document.getElementById('sta_psk');"
-    "if(p.type==='password'){p.type='text';togglePsk.textContent='Hide';}"
-    "else{p.type='password';togglePsk.textContent='Show';}};"
-    "tabSetup.onclick=()=>setTab('setup');"
-    "tabFiles.onclick=()=>setTab('files');"
-    "function setTab(name){"
-    "activeTab=name;"
-    "if(name==='setup'){tabSetup.classList.add('active');tabFiles.classList.remove('active');"
-    "setupView.classList.add('active');filesView.classList.remove('active');}"
-    "else{tabFiles.classList.add('active');tabSetup.classList.remove('active');"
-    "filesView.classList.add('active');setupView.classList.remove('active');"
-    "refreshFiles();}}"
-    "function setFsMsg(msg,isErr){fsMsg.textContent=msg||'';fsMsg.style.color=isErr?'#c00':'#0b5';}"
-    "function setButtonsEnabled(enabled){"
-    "btnUpload.disabled=!enabled||uploading;"
-    "btnMkdir.disabled=!enabled||uploading;"
-    "btnRename.disabled=!enabled||uploading||!selected;"
-    "btnDelete.disabled=!enabled||uploading||!selected;"
-    "btnDownload.disabled=!enabled||uploading||!selected||selected.type!=='file';"
-    "btnAttach.disabled=!enabled||uploading;"
-    "chkOverwrite.disabled=!enabled||uploading;"
-    "}"
-    "function updateFsGate(status){"
-    "let reason='';"
-    "if(status.usb_mode==='ATTACHED'){reason='BUSY: USB Mass Storage attached. Detach USB to manage files.';}"
-    "else if(!status.sd_mounted){reason='SD not mounted. Run usb detach first.';}"
-    "fsBlockedReason=reason;"
-    "if(reason){fsBusy.style.display='block';fsBusyText.textContent=reason;"
-    "btnDetach.style.display=status.usb_mode==='ATTACHED'?'inline-block':'none';"
-    "setButtonsEnabled(false);}"
-    "else{fsBusy.style.display='none';setButtonsEnabled(true);}"
-    "btnAttach.style.display=status.usb_mode==='ATTACHED'?'none':'inline-block';"
-    "btnAttach.disabled=(status.usb_mode==='ATTACHED')||uploading;"
-    "}"
-    "function renderBreadcrumb(path){"
-    "fsPath.innerHTML='';"
-    "const root=document.createElement('span');root.textContent='/sdcard';root.className='crumb';"
-    "root.onclick=()=>{currentPath='/';refreshFiles();};fsPath.appendChild(root);"
-    "const parts=path.split('/').filter(p=>p);"
-    "let acc='';"
-    "parts.forEach(p=>{acc+='/'+p;const sep=document.createElement('span');"
-    "sep.textContent=' / ';sep.className='crumb-sep';fsPath.appendChild(sep);"
-    "const c=document.createElement('span');c.textContent=p;c.className='crumb';"
-    "c.onclick=()=>{currentPath=acc;refreshFiles();};fsPath.appendChild(c);});"
-    "}"
-    "function renderList(items){"
-    "fsBody.innerHTML='';selected=null;setButtonsEnabled(!fsBlockedReason);"
-    "items.forEach(item=>{const tr=document.createElement('tr');"
-    "tr.dataset.name=item.name;tr.dataset.type=item.type;"
-    "tr.innerHTML='<td>'+(item.type==='dir'?'DIR':'FILE')+'</td><td>'+item.name+'</td><td>'+(item.size||'')+'</td>';"
-    "tr.onclick=()=>{selectItem(item,tr);};"
-    "tr.ondblclick=()=>{if(item.type==='dir'){currentPath=joinPath(currentPath,item.name);refreshFiles();}};"
-    "fsBody.appendChild(tr);});"
-    "}"
-    "function selectItem(item,row){"
-    "Array.from(fsBody.children).forEach(r=>r.classList.remove('selected'));"
-    "row.classList.add('selected');"
-    "selected=item;setButtonsEnabled(!fsBlockedReason);"
-    "}"
-    "function joinPath(base,name){return base==='/'?'/'+name:base+'/'+name;}"
-    "function fmtBytes(n){"
-    "if(n<1024){return n+' B';}"
-    "if(n<1024*1024){return (n/1024).toFixed(1)+' KB';}"
-    "if(n<1024*1024*1024){return (n/1024/1024).toFixed(1)+' MB';}"
-    "return (n/1024/1024/1024).toFixed(1)+' GB';}"
-    "function resetProgress(){fsProgress.style.display='none';"
-    "fsProgressBar.style.width='0%';fsProgressText.textContent='';}"
-    "function updateProgress(loaded,total,rate){"
-    "fsProgress.style.display='block';"
-    "const pct=total>0?Math.min(100,(loaded/total)*100):0;"
-    "fsProgressBar.style.width=pct.toFixed(1)+'%';"
-    "const speed=rate>0?(' '+fmtBytes(rate)+'/s'):'';"
-    "fsProgressText.textContent=fmtBytes(loaded)+' / '+fmtBytes(total)+' ('+pct.toFixed(1)+'%'+speed+')';}"
-    "async function refreshFiles(){"
-    "if(fsBlockedReason){setFsMsg(fsBlockedReason,true);return;}"
-    "setFsMsg('',false);"
-    "const res=await fetch('/api/fs/list?path='+encodeURIComponent(currentPath));"
-    "if(!res.ok){let err='ERR';try{const j=await res.json();err=j.error||err;}catch(e){}"
-    "setFsMsg(err,true);return;}"
-    "const j=await res.json();currentPath=j.path||'/';renderBreadcrumb(currentPath);renderList(j.items||[]);"
-    "}"
-    "async function uploadFile(file){"
-    "if(fsBlockedReason||uploading){return;}"
-    "uploading=true;setButtonsEnabled(false);setFsMsg('Uploading...',false);"
-    "resetProgress();"
-    "const fd=new FormData();fd.append('file',file,file.name);"
-    "const xhr=new XMLHttpRequest();"
+    "<div id=\"usbWarning\" class=\"banner-warn\">⚠ USB CONTROLLED BY HOST ⚠<br>FILE OPERATIONS LOCKED</div>"
+    "<div style=\"display:flex;justify-content:space-between;margin-bottom:15px;background:rgba(255,0,255,0.1);padding:10px;border:1px solid var(--pink);\">"
+    "<span>USB INTERFACE CONTROL:</span><div><button id=\"btnAttach\" class=\"btn\" onclick=\"usbAction('attach')\">MOUNT (ATTACH)</button>"
+    "<button id=\"btnDetach\" class=\"btn btn-green\" onclick=\"usbAction('detach')\" style=\"display:none;\">EJECT (DETACH)</button></div></div>"
+    "<div id=\"progressContainer\" class=\"progress-container\"><div id=\"progressBar\" class=\"progress-bar\"></div>"
+    "<div id=\"progressText\" class=\"progress-text\"></div></div>"
+    "<div id=\"toolbar\" class=\"toolbar\"><button class=\"btn\" onclick=\"triggerUpload()\">[↑] UPLOAD</button>"
+    "<button class=\"btn\" onclick=\"fsMkdir()\">[+] NEW DIR</button><button class=\"btn\" onclick=\"fsRename()\">[R] RENAME</button>"
+    "<button class=\"btn\" style=\"border-color:var(--red);color:var(--red);\" onclick=\"fsDelete()\">[x] DELETE</button>"
+    "<button class=\"btn\" onclick=\"fsDownload()\">[↓] DOWNLOAD</button>"
+    "<input id=\"fileInput\" type=\"file\" style=\"display:none\"></div>"
+    "<div style=\"margin-bottom:10px;\">PATH: <span id=\"fsPath\" style=\"color:var(--pink)\">/</span></div>"
+    "<div id=\"dropZone\">>> DRAG & DROP G-CODE FILES HERE <<</div>"
+    "<table class=\"file-list\"><thead><tr><th>TYPE</th><th>NAME</th><th>SIZE</th></tr></thead><tbody id=\"fsBody\"></tbody></table>"
+    "</div></div><script>"
+    "let currentPath='/';let selected=null;let uploading=false;let filled=false;"
+    "function fmt(b){if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';return(b/1048576).toFixed(1)+' MB';}"
+    "function setTab(t){document.querySelectorAll('.view').forEach(e=>e.classList.remove('active'));"
+    "document.querySelectorAll('.tab-btn').forEach(e=>e.classList.remove('active'));"
+    "document.getElementById(t+'View').classList.add('active');"
+    "document.getElementById('tab'+(t==='setup'?'Setup':'Files')).classList.add('active');"
+    "if(t==='files') refreshFiles();}"
+    "async function updateStatus(){try{const r=await fetch('/api/status');const j=await r.json();"
+    "const sSys=document.getElementById('stSys');const sUsb=document.getElementById('stUsb');"
+    "if(j.sta_connected){sSys.textContent='ONLINE ('+j.sta_ip+')';sSys.className='status-badge status-ok';}"
+    "else if(j.sta_connecting){sSys.textContent='CONNECTING...';sSys.className='status-badge status-warn';}"
+    "else{sSys.textContent='OFFLINE (AP)';sSys.className='status-badge';}"
+    "if(j.usb_mode==='ATTACHED'){sUsb.textContent='ATTACHED';sUsb.className='status-badge status-warn';"
+    "document.getElementById('usbWarning').style.display='block';document.getElementById('toolbar').classList.add('disabled');"
+    "document.getElementById('btnAttach').style.display='none';document.getElementById('btnDetach').style.display='inline-block';}"
+    "else{sUsb.textContent='DETACHED';sUsb.className='status-badge status-ok';"
+    "document.getElementById('usbWarning').style.display='none';document.getElementById('toolbar').classList.remove('disabled');"
+    "document.getElementById('btnAttach').style.display='inline-block';document.getElementById('btnDetach').style.display='none';}"
+    "document.getElementById('valDevName').textContent=j.dev_name;"
+    "document.getElementById('valSsid').textContent=j.ssid||j.ap_ssid;"
+    "document.getElementById('valIp').textContent=j.sta_ip;"
+    "document.getElementById('valLastIp').textContent=j.last_sta_ip||'-';"
+    "document.getElementById('valRssi').textContent=j.rssi+' dBm';"
+    "document.getElementById('valUptime').textContent=Math.floor(j.uptime_s/60)+'m '+j.uptime_s%60+'s';"
+    "document.getElementById('valSd').textContent=j.sd_mounted?'MOUNTED':'UNMOUNTED';"
+    "if(!filled){document.getElementById('device_name').value=j.dev_name||'';document.getElementById('sta_ssid').value=j.ssid||'';"
+    "document.getElementById('sta_psk').value=j.sta_psk||'';document.getElementById('web_port').value=j.web_port||80;"
+    "document.getElementById('wifi_boot').value=(j.wifi_boot||'ap').toLowerCase();filled=true;}"
+    "}catch(e){console.error(e);}}setInterval(updateStatus,2000);updateStatus();"
+    "document.getElementById('cfgForm').onsubmit=async(e)=>{e.preventDefault();const msg=document.getElementById('saveMsg');"
+    "msg.textContent='SAVING...';const fd=new FormData(e.target);const r=await fetch('/api/config',{method:'POST',body:new URLSearchParams(fd)});"
+    "const j=await r.json();msg.textContent=j.ok?'SAVED. CONNECTING...':'ERROR: '+j.error;};"
+    "async function usbAction(act){await fetch('/api/usb/'+act,{method:'POST'});updateStatus();}"
+    "async function refreshFiles(){const r=await fetch('/api/fs/list?path='+encodeURIComponent(currentPath));"
+    "const j=await r.json();currentPath=j.path||'/';document.getElementById('fsPath').textContent=currentPath;"
+    "const tb=document.getElementById('fsBody');tb.innerHTML='';selected=null;"
+    "if(currentPath!=='/'){addRow({type:'dir',name:'..'});}"
+    "(j.items||[]).forEach(i=>addRow(i));}"
+    "function addRow(i){const tr=document.createElement('tr');"
+    "tr.innerHTML='<td>'+(i.type==='dir'?'[DIR]':'[FILE]')+'</td><td>'+i.name+'</td><td>'+(i.size||'')+'</td>';"
+    "tr.onclick=()=>{Array.from(tr.parentNode.children).forEach(r=>r.classList.remove('selected'));tr.classList.add('selected');selected=i;};"
+    "tr.ondblclick=()=>{if(i.type==='dir'){currentPath=i.name==='..'?currentPath.split('/').slice(0,-1).join('/')||'/':(currentPath==='/'?'/':currentPath+'/')+i.name;refreshFiles();}};"
+    "document.getElementById('fsBody').appendChild(tr);}"
+    "function triggerUpload(){document.getElementById('fileInput').click();}"
+    "document.getElementById('fileInput').onchange=(e)=>{if(e.target.files[0]) uploadFile(e.target.files[0]);};"
+    "const dz=document.getElementById('dropZone');"
+    "dz.ondragover=e=>{e.preventDefault();dz.classList.add('hover');};dz.ondragleave=()=>{dz.classList.remove('hover');};"
+    "dz.ondrop=e=>{e.preventDefault();dz.classList.remove('hover');if(e.dataTransfer.files[0]) uploadFile(e.dataTransfer.files[0]);};"
+    "function uploadFile(file){if(uploading)return;uploading=true;"
+    "const pc=document.getElementById('progressContainer');const pb=document.getElementById('progressBar');const pt=document.getElementById('progressText');"
+    "pc.style.display='block';const fd=new FormData();fd.append('file',file);const xhr=new XMLHttpRequest();"
     "const start=performance.now();"
-    "xhr.upload.onprogress=(e)=>{"
-    "const total=e.lengthComputable?e.total:file.size;"
-    "const loaded=e.loaded;"
-    "const elapsed=(performance.now()-start)/1000;"
-    "const rate=elapsed>0?loaded/elapsed:0;"
-    "updateProgress(loaded,total,rate);};"
-    "xhr.onreadystatechange=()=>{if(xhr.readyState!==4){return;}"
-    "let ok=xhr.status>=200&&xhr.status<300;"
-    "if(ok){setFsMsg('Done',false);refreshFiles();}"
-    "else{let err='UPLOAD_FAIL';try{const j=JSON.parse(xhr.responseText);err=j.error||err;}catch(e){}"
-    "if(err==='FILE_EXISTS' && !(chkOverwrite&&chkOverwrite.checked)){err='FILE_EXISTS (enable Overwrite)';}"
-    "setFsMsg(err,true);}uploading=false;setButtonsEnabled(!fsBlockedReason);resetProgress();};"
-    "xhr.onerror=()=>{setFsMsg('UPLOAD_NET',true);uploading=false;setButtonsEnabled(!fsBlockedReason);resetProgress();};"
-    "xhr.onabort=()=>{setFsMsg('UPLOAD_ABORT',true);uploading=false;setButtonsEnabled(!fsBlockedReason);resetProgress();};"
-    "const ow=(chkOverwrite&&chkOverwrite.checked)?'1':'0';"
-    "xhr.open('POST','/api/fs/upload?path='+encodeURIComponent(currentPath)+'&overwrite='+ow,true);"
-    "xhr.send(fd);"
-    "}"
-    "btnUpload.onclick=()=>{fileInput.value='';fileInput.click();};"
-    "fileInput.onchange=()=>{const f=fileInput.files[0];if(f){uploadFile(f);}};"
-    "drop.addEventListener('dragover',e=>{e.preventDefault();drop.classList.add('hover');});"
-    "drop.addEventListener('dragleave',()=>{drop.classList.remove('hover');});"
-    "drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('hover');"
-    "const f=e.dataTransfer.files[0];if(f){uploadFile(f);}});"
-    "btnMkdir.onclick=async()=>{if(fsBlockedReason){return;}const name=prompt('Folder name');"
-    "if(!name){return;}const body=JSON.stringify({path:currentPath,name:name});"
-    "const res=await fetch('/api/fs/mkdir',{method:'POST',headers:{'Content-Type':'application/json'},body:body});"
-    "if(!res.ok){let err='MKDIR_FAIL';try{const j=await res.json();err=j.error||err;}catch(e){}"
-    "setFsMsg(err,true);}else{setFsMsg('Done',false);refreshFiles();}};"
-    "btnRename.onclick=async()=>{if(!selected||fsBlockedReason){return;}"
-    "const name=prompt('New name',selected.name);if(!name){return;}"
-    "const body=JSON.stringify({path:joinPath(currentPath,selected.name),new_name:name});"
-    "const res=await fetch('/api/fs/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:body});"
-    "if(!res.ok){let err='RENAME_FAIL';try{const j=await res.json();err=j.error||err;}catch(e){}"
-    "setFsMsg(err,true);}else{setFsMsg('Done',false);refreshFiles();}};"
-    "btnDelete.onclick=async()=>{if(!selected||fsBlockedReason){return;}"
-    "if(!confirm('Delete '+selected.name+'?')){return;}"
-    "const body=JSON.stringify({path:joinPath(currentPath,selected.name)});"
-    "const res=await fetch('/api/fs/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:body});"
-    "if(!res.ok){let err='DELETE_FAIL';try{const j=await res.json();err=j.error||err;}catch(e){}"
-    "setFsMsg(err,true);}else{setFsMsg('Done',false);refreshFiles();}};"
-    "btnDownload.onclick=()=>{if(!selected||selected.type!=='file'){return;}"
-    "window.location='/api/fs/download?path='+encodeURIComponent(joinPath(currentPath,selected.name));};"
-    "btnAttach.onclick=async()=>{const res=await fetch('/api/usb/attach',{method:'POST'});"
-    "if(res.ok){setFsMsg('Attached',false);}else{setFsMsg('ATTACH_FAIL',true);}};"
-    "btnDetach.onclick=async()=>{const res=await fetch('/api/usb/detach',{method:'POST'});"
-    "if(res.ok){setFsMsg('Detached',false);setTimeout(refreshFiles,500);}else{setFsMsg('DETACH_FAIL',true);}};"
-    "async function refreshStatus(){"
-    "const r=await fetch('/api/status');if(!r.ok){return;}const j=await r.json();"
-    "statusEl.textContent=JSON.stringify(j,null,2);"
-    "if(!filled){document.getElementById('device_name').value=j.dev_name||'';"
-    "document.getElementById('sta_ssid').value=j.ssid||'';"
-    "document.getElementById('web_port').value=j.web_port||'';"
-    "document.getElementById('sta_psk').value=j.sta_psk||'';"
-    "document.getElementById('wifi_boot').value=(j.wifi_boot||'AP').toLowerCase();"
-    "filled=true;}"
-    "const port=j.web_port&&j.web_port!=80?(':'+j.web_port):'';"
-    "const mdns=j.mdns_name?('http://'+j.mdns_name+'.local'+port):'';"
-    "if(mdns){openBtn.textContent='Open '+mdns;openBtn.dataset.url=mdns;}"
-    "if(j.sta_connecting){msgEl.textContent='Connecting to '+(j.ssid||'')+'...';errEl.textContent='';}"
-    "else if(j.sta_connected){msgEl.textContent='Connected: '+j.sta_ip+' (RSSI '+j.rssi+' dBm)';errEl.textContent='';"
-    "if(!redirected&&mdns){redirected=true;localStorage.setItem('mdns_redirected','1');"
-    "setTimeout(()=>{window.location=mdns;},2500);}}"
-    "else if(j.sta_error){errEl.textContent=j.sta_error;}"
-    "updateFsGate(j);"
-    "}"
-    "form.addEventListener('submit',async(e)=>{"
-    "e.preventDefault();msgEl.textContent='Saving...';errEl.textContent='';"
-    "localStorage.removeItem('mdns_redirected');redirected=false;"
-    "const fd=new FormData(form);"
-    "const res=await fetch('/api/config',{method:'POST',body:new URLSearchParams(fd)});"
-    "const j=await res.json();"
-    "if(j.ok){msgEl.textContent='Saved, connecting...';}"
-    "else{errEl.textContent=j.error||'failed';msgEl.textContent='';}"
-    "});"
-    "setInterval(refreshStatus,2000);refreshStatus();"
-    "</script>"
-    "</body></html>";
+    "xhr.upload.onprogress=e=>{const p=(e.loaded/e.total)*100;const t=(performance.now()-start)/1000;const s=t>0?e.loaded/t:0;"
+    "pb.style.width=p+'%';pt.textContent='UPLOADING: '+p.toFixed(0)+'% @ '+fmt(s)+'/s';};"
+    "xhr.onload=()=>{uploading=false;pc.style.display='none';refreshFiles();};"
+    "xhr.onerror=()=>{uploading=false;alert('Upload failed');pc.style.display='none';};"
+    "xhr.open('POST','/api/fs/upload?path='+encodeURIComponent(currentPath)+'&overwrite=1');xhr.send(fd);}"
+    "async function fsMkdir(){const n=prompt('FOLDER NAME:');if(n) await apiCall('/api/fs/mkdir',{path:currentPath,name:n});}"
+    "async function fsRename(){if(!selected)return;const n=prompt('NEW NAME:',selected.name);"
+    "if(n) await apiCall('/api/fs/rename',{path:(currentPath==='/'?'/':currentPath+'/')+selected.name,new_name:n});}"
+    "async function fsDelete(){if(!selected||!confirm('DELETE '+selected.name+'?'))return;"
+    "await apiCall('/api/fs/delete',{path:(currentPath==='/'?'/':currentPath+'/')+selected.name});}"
+    "function fsDownload(){if(selected&&selected.type==='file') window.location='/api/fs/download?path='+encodeURIComponent((currentPath==='/'?'/':currentPath+'/')+selected.name);}"
+    "async function apiCall(u,d){await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});refreshFiles();}"
+    "</script></body></html>";
 
 static esp_err_t http_root_get(httpd_req_t *req)
 {
@@ -1024,9 +827,11 @@ static esp_err_t http_status_get(httpd_req_t *req)
     rssi = s_sta_rssi;
     state_unlock();
 
-    if (sta_conn) {
+    if (sta_conn)
+    {
         wifi_ap_record_t ap_info;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+        {
             rssi = ap_info.rssi;
         }
     }
@@ -1045,7 +850,7 @@ static esp_err_t http_status_get(httpd_req_t *req)
              s_active ? s_ap_ssid : "",
              s_active ? s_ap_ip : "",
              (unsigned)uptime_s,
-             last_ip[0] ? last_ip : "0.0.0.0",
+             last_ip[0] ? last_ip : "", // Передаем last_sta_ip
              usb_mode_str(),
              usb_host,
              mounted ? "true" : "false",
@@ -1069,16 +874,19 @@ static esp_err_t http_status_get(httpd_req_t *req)
 static esp_err_t http_config_post(httpd_req_t *req)
 {
     int total = req->content_len;
-    if (total <= 0 || total > 1024) {
+    if (total <= 0 || total > 1024)
+    {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid size");
         return ESP_FAIL;
     }
 
     char body[1024];
     int received = 0;
-    while (received < total) {
+    while (received < total)
+    {
         int r = httpd_req_recv(req, body + received, total - received);
-        if (r <= 0) {
+        if (r <= 0)
+        {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
             return ESP_FAIL;
         }
@@ -1093,14 +901,18 @@ static esp_err_t http_config_post(httpd_req_t *req)
     has_ssid = (s_cfg.sta_ssid[0] != '\0');
     cfg_unlock();
     httpd_resp_set_type(req, "application/json");
-    if (ok) {
+    if (ok)
+    {
         httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-    } else {
+    }
+    else
+    {
         char resp[64];
         snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", err[0] ? err : "failed");
         httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     }
-    if (ok && has_ssid) {
+    if (ok && has_ssid)
+    {
         schedule_sta_connect();
     }
     return ESP_OK;
@@ -1108,7 +920,8 @@ static esp_err_t http_config_post(httpd_req_t *req)
 
 static esp_err_t setup_http_start(void)
 {
-    if (s_http) {
+    if (s_http)
+    {
         return ESP_OK;
     }
 
@@ -1122,7 +935,8 @@ static esp_err_t setup_http_start(void)
     cfg.stack_size = 8192;
 
     esp_err_t err = httpd_start(&s_http, &cfg);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         return err;
     }
     s_http_port = port;
@@ -1156,22 +970,23 @@ static esp_err_t setup_http_start(void)
 
 esp_err_t setup_mode_init(void)
 {
-    if (!s_cfg_mutex) {
+    if (!s_cfg_mutex)
+    {
         s_cfg_mutex = xSemaphoreCreateMutex();
-        if (!s_cfg_mutex) {
+        if (!s_cfg_mutex)
             return ESP_ERR_NO_MEM;
-        }
     }
-    if (!s_state_mutex) {
+    if (!s_state_mutex)
+    {
         s_state_mutex = xSemaphoreCreateMutex();
-        if (!s_state_mutex) {
+        if (!s_state_mutex)
             return ESP_ERR_NO_MEM;
-        }
     }
 
     wimill_config_t cfg;
     esp_err_t err = config_load(&cfg);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         config_load_defaults(&cfg);
     }
     cfg_lock();
@@ -1184,18 +999,19 @@ esp_err_t setup_mode_init(void)
 
 esp_err_t setup_mode_start(void)
 {
-    if (s_active) {
+    if (s_active)
         return ESP_OK;
-    }
 
     s_sta_only_mode = false;
     esp_err_t err = setup_wifi_start();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "Wi-Fi AP start failed: %s", esp_err_to_name(err));
         return err;
     }
     err = setup_http_start();
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG, "HTTP start failed: %s", esp_err_to_name(err));
         return err;
     }
@@ -1208,9 +1024,8 @@ esp_err_t setup_mode_start(void)
 
 esp_err_t setup_mode_autostart(void)
 {
-    if (s_active) {
+    if (s_active)
         return ESP_OK;
-    }
 
     uint8_t boot_mode = WIFI_BOOT_AP;
     bool has_ssid = false;
@@ -1219,12 +1034,15 @@ esp_err_t setup_mode_autostart(void)
     has_ssid = (s_cfg.sta_ssid[0] != '\0');
     cfg_unlock();
 
-    if (boot_mode == WIFI_BOOT_AP) {
+    if (boot_mode == WIFI_BOOT_AP)
+    {
         return setup_mode_start();
     }
 
-    if (boot_mode == WIFI_BOOT_STA) {
-        if (!has_ssid) {
+    if (boot_mode == WIFI_BOOT_STA)
+    {
+        if (!has_ssid)
+        {
             led_status_set_wifi(false);
             return ESP_OK;
         }
