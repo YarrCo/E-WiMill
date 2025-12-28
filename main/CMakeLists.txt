@@ -14,6 +14,7 @@ idf_component_register(
     REQUIRES
         driver
         sdmmc
+        esp_driver_sdmmc
         fatfs
         led_strip
         esp_tinyusb

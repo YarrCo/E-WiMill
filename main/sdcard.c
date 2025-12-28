@@ -8,8 +8,7 @@
 #include <sys/unistd.h>
 
 #include "driver/gpio.h"
-#include "driver/spi_master.h"
-#include "driver/sdspi_host.h"
+#include "driver/sdmmc_host.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -25,14 +24,10 @@
 #define DEFAULT_ALLOC_UNIT (32 * 1024)
 #define SDTEST_FILE_PATH "/sdcard/.wimill_sdtest.bin"
 #define SDTEST_BLOCK_MIN 4096
-#define SDSPI_MAX_TRANSFER (8 * 1024)
-
 static sdmmc_card_t *s_card = NULL;
 static bool s_card_raw_alloc = false;
 static bool s_mounted = false;
-static spi_host_device_t s_host_id = SPI2_HOST;
-static sdspi_dev_handle_t s_dev_handle = 0;
-static bool s_bus_inited = false;
+static bool s_host_inited = false;
 static uint32_t s_current_freq_khz = WIMILL_SD_FREQ_KHZ_DEFAULT;
 static SemaphoreHandle_t s_fs_mutex = NULL;
 static size_t s_sdtest_buf_bytes = WIMILL_SDTEST_BUF_SZ;
@@ -97,35 +92,57 @@ static bool vfs_allowed_locked(void)
     return s_mode == SDCARD_MODE_APP;
 }
 
-static esp_err_t sdspi_bus_init_locked(const spi_bus_config_t *bus_cfg)
+static void sdmmc_drive_dat3_high(void)
 {
-    if (s_bus_inited) {
-        return ESP_OK;
-    }
-    esp_err_t ret = spi_bus_initialize(s_host_id, bus_cfg, SDSPI_DEFAULT_DMA);
-    if (ret == ESP_OK || ret == ESP_ERR_INVALID_STATE) {
-        s_bus_inited = true;
-        return ESP_OK;
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << WIMILL_PIN_SD_CS,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(WIMILL_PIN_SD_CS, 1);
+}
+
+static void sdmmc_prepare_slot_config(sdmmc_slot_config_t *slot_config)
+{
+    *slot_config = (sdmmc_slot_config_t)SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config->width = 1;
+    slot_config->clk = WIMILL_PIN_SD_SCK;
+    slot_config->cmd = WIMILL_PIN_SD_MOSI;
+    slot_config->d0 = WIMILL_PIN_SD_MISO;
+    slot_config->d1 = GPIO_NUM_NC;
+    slot_config->d2 = GPIO_NUM_NC;
+    slot_config->d3 = GPIO_NUM_NC;
+    slot_config->d4 = GPIO_NUM_NC;
+    slot_config->d5 = GPIO_NUM_NC;
+    slot_config->d6 = GPIO_NUM_NC;
+    slot_config->d7 = GPIO_NUM_NC;
+    slot_config->cd = GPIO_NUM_NC;
+    slot_config->wp = GPIO_NUM_NC;
+    slot_config->flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+}
+
+static esp_err_t sdmmc_host_init_locked(void)
+{
+    esp_err_t ret = sdmmc_host_init();
+    if (ret == ESP_OK) {
+        s_host_inited = true;
     }
     return ret;
 }
 
-static void sdspi_bus_deinit_locked(void)
+static void sdmmc_host_deinit_locked(void)
 {
-    if (s_dev_handle) {
-        esp_err_t ret = sdspi_host_remove_device(s_dev_handle);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "sdspi remove device failed: %s", esp_err_to_name(ret));
-        }
-        s_dev_handle = 0;
+    if (!s_host_inited) {
+        return;
     }
-    if (s_bus_inited) {
-        esp_err_t ret = spi_bus_free(s_host_id);
-        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "spi bus free failed: %s", esp_err_to_name(ret));
-        }
-        s_bus_inited = false;
+    esp_err_t ret = sdmmc_host_deinit();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "sdmmc host deinit failed: %s", esp_err_to_name(ret));
     }
+    s_host_inited = false;
 }
 
 static void sdcard_free_raw_locked(void)
@@ -135,6 +152,7 @@ static void sdcard_free_raw_locked(void)
     }
     s_card = NULL;
     s_card_raw_alloc = false;
+    sdmmc_host_deinit_locked();
 }
 
 esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
@@ -152,47 +170,22 @@ esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
         return ESP_ERR_INVALID_STATE;
     }
 
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = s_host_id;
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.max_freq_khz = s_current_freq_khz;
+    sdmmc_slot_config_t slot_config;
+    sdmmc_prepare_slot_config(&slot_config);
+    sdmmc_drive_dat3_high();
 
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = WIMILL_PIN_SD_MOSI,
-        .miso_io_num = WIMILL_PIN_SD_MISO,
-        .sclk_io_num = WIMILL_PIN_SD_SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = SDSPI_MAX_TRANSFER,
-    };
-
-    gpio_set_pull_mode(WIMILL_PIN_SD_MOSI, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(WIMILL_PIN_SD_MISO, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(WIMILL_PIN_SD_SCK, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(WIMILL_PIN_SD_CS, GPIO_PULLUP_ONLY);
-
-    esp_err_t ret = sdspi_bus_init_locked(&bus_cfg);
+    esp_err_t ret = sdmmc_host_init_locked();
     if (ret != ESP_OK) {
         sdcard_unlock();
         return ret;
     }
 
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = WIMILL_PIN_SD_CS;
-    slot_config.host_id = host.slot;
-
-    if (!s_dev_handle) {
-        ret = sdspi_host_init_device(&slot_config, &s_dev_handle);
-        if (ret == ESP_ERR_INVALID_STATE) {
-            sdspi_bus_deinit_locked();
-            ret = sdspi_bus_init_locked(&bus_cfg);
-            if (ret == ESP_OK) {
-                ret = sdspi_host_init_device(&slot_config, &s_dev_handle);
-            }
-        }
-        if (ret != ESP_OK) {
-            sdcard_unlock();
-            return ret;
-        }
+    ret = sdmmc_host_init_slot(host.slot, &slot_config);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        sdcard_unlock();
+        return ret;
     }
 
     if (!s_card || !s_card_raw_alloc) {
@@ -210,6 +203,20 @@ esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
         return ESP_ERR_NO_MEM;
     }
     ret = sdmmc_card_init(&host, s_card);
+    if (ret != ESP_OK && s_current_freq_khz > WIMILL_SD_FREQ_KHZ_20MHZ) {
+        ESP_LOGW(TAG, "SD init failed at %u kHz, retrying at %u kHz",
+                 s_current_freq_khz, WIMILL_SD_FREQ_KHZ_20MHZ);
+        s_current_freq_khz = WIMILL_SD_FREQ_KHZ_20MHZ;
+        host.max_freq_khz = s_current_freq_khz;
+        sdmmc_host_deinit_locked();
+        ret = sdmmc_host_init_locked();
+        if (ret == ESP_OK) {
+            ret = sdmmc_host_init_slot(host.slot, &slot_config);
+            if (ret == ESP_OK || ret == ESP_ERR_INVALID_STATE) {
+                ret = sdmmc_card_init(&host, s_card);
+            }
+        }
+    }
     if (ret != ESP_OK) {
         sdcard_free_raw_locked();
         sdcard_unlock();
@@ -264,31 +271,13 @@ esp_err_t sdcard_mount(void)
         return ESP_OK;
     }
 
-    sdspi_bus_deinit_locked();
     sdcard_free_raw_locked();
 
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = s_host_id;
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.max_freq_khz = s_current_freq_khz;
-
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = WIMILL_PIN_SD_MOSI,
-        .miso_io_num = WIMILL_PIN_SD_MISO,
-        .sclk_io_num = WIMILL_PIN_SD_SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = SDSPI_MAX_TRANSFER,
-    };
-
-    esp_err_t ret = sdspi_bus_init_locked(&bus_cfg);
-    if (ret != ESP_OK) {
-        sdcard_unlock();
-        return ret;
-    }
-
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = WIMILL_PIN_SD_CS;
-    slot_config.host_id = host.slot;
+    sdmmc_slot_config_t slot_config;
+    sdmmc_prepare_slot_config(&slot_config);
+    sdmmc_drive_dat3_high();
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
@@ -297,7 +286,14 @@ esp_err_t sdcard_mount(void)
         .disk_status_check_enable = true,
     };
 
-    ret = esp_vfs_fat_sdspi_mount(WIMILL_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+    esp_err_t ret = esp_vfs_fat_sdmmc_mount(WIMILL_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+    if (ret != ESP_OK && s_current_freq_khz > WIMILL_SD_FREQ_KHZ_20MHZ) {
+        ESP_LOGW(TAG, "SD mount failed at %u kHz, retrying at %u kHz",
+                 s_current_freq_khz, WIMILL_SD_FREQ_KHZ_20MHZ);
+        s_current_freq_khz = WIMILL_SD_FREQ_KHZ_20MHZ;
+        host.max_freq_khz = s_current_freq_khz;
+        ret = esp_vfs_fat_sdmmc_mount(WIMILL_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
+    }
     if (ret == ESP_OK) {
         s_mounted = true;
         s_card_raw_alloc = false;
@@ -324,7 +320,7 @@ esp_err_t sdcard_unmount(void)
         s_mounted = false;
         s_card = NULL;
         s_card_raw_alloc = false;
-        sdspi_bus_deinit_locked();
+        s_host_inited = false;
     }
     sdcard_unlock();
     return ret;
