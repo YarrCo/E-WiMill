@@ -84,6 +84,7 @@ void cli_print_help(void)
     printf("  sdtest [mb] [kHz] [buf N] - write+verify file (queued)\n");
     printf("  sdbench [mb] [buf N] - write+read speed test (queued)\n");
     printf("  sd freq [kHz]       - show/set SD SPI freq (20000..40000)\n");
+    printf("  sd check [0|1]      - disk status check (remount)\n");
     printf("  usb status|attach|detach  - manage MSC state\n");
 }
 
@@ -345,30 +346,52 @@ static void handle_touch(const char *name, const char *size_str)
 
 static void handle_sd_freq(int argc, char *argv[])
 {
-    if (argc < 2 || strcmp(argv[1], "freq") != 0) {
-        ESP_LOGW(TAG, "Usage: sd freq [20000..40000]");
-        return;
-    }
     if (msc_get_state() == MSC_STATE_USB_ATTACHED) {
         ESP_LOGW(TAG, "BUSY: detach first");
         return;
     }
 
-    if (argc == 2) {
-        ESP_LOGI(TAG, "SD freq current=%u kHz default=%u kHz",
-                 sdcard_get_current_freq_khz(), sdcard_get_default_freq_khz());
+    if (argc >= 2 && strcmp(argv[1], "freq") == 0) {
+        if (argc == 2) {
+            ESP_LOGI(TAG, "SD freq current=%u kHz default=%u kHz",
+                     sdcard_get_current_freq_khz(), sdcard_get_default_freq_khz());
+            return;
+        }
+
+        uint32_t freq = (uint32_t)strtoul(argv[2], NULL, 10);
+        esp_err_t err = sdcard_set_frequency(freq, sdcard_is_mounted());
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "SD freq set to %u kHz%s",
+                     freq,
+                     sdcard_is_mounted() ? " (remounted)" : " (applies on next mount)");
+        } else {
+            ESP_LOGE(TAG, "SD freq set failed: %s", esp_err_to_name(err));
+        }
         return;
     }
 
-    uint32_t freq = (uint32_t)strtoul(argv[2], NULL, 10);
-    esp_err_t err = sdcard_set_frequency(freq, sdcard_is_mounted());
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "SD freq set to %u kHz%s",
-                 freq,
-                 sdcard_is_mounted() ? " (remounted)" : " (applies on next mount)");
-    } else {
-        ESP_LOGE(TAG, "SD freq set failed: %s", esp_err_to_name(err));
+    if (argc >= 2 && strcmp(argv[1], "check") == 0) {
+        if (argc == 2) {
+            ESP_LOGI(TAG, "SD check=%s", sdcard_get_disk_status_check() ? "on" : "off");
+            return;
+        }
+        int val = atoi(argv[2]);
+        if (val != 0 && val != 1) {
+            ESP_LOGW(TAG, "Usage: sd check [0|1]");
+            return;
+        }
+        esp_err_t err = sdcard_set_disk_status_check(val == 1, sdcard_is_mounted());
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "SD check set to %s%s",
+                     val ? "on" : "off",
+                     sdcard_is_mounted() ? " (remounted)" : " (applies on next mount)");
+        } else {
+            ESP_LOGE(TAG, "SD check set failed: %s", esp_err_to_name(err));
+        }
+        return;
     }
+
+    ESP_LOGW(TAG, "Usage: sd freq [20000..40000] | sd check [0|1]");
 }
 
 static void handle_sdtest(int argc, char *argv[])

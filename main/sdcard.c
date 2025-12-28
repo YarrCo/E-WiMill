@@ -35,6 +35,7 @@ static spi_host_device_t s_host_id = SPI2_HOST;
 static sdspi_dev_handle_t s_dev_handle = 0;
 static bool s_bus_inited = false;
 static uint32_t s_current_freq_khz = WIMILL_SD_FREQ_KHZ_DEFAULT;
+static bool s_disk_status_check = true;
 static SemaphoreHandle_t s_fs_mutex = NULL;
 static size_t s_sdtest_buf_bytes = WIMILL_SDTEST_BUF_SZ;
 static sdcard_mode_t s_mode = SDCARD_MODE_USB;
@@ -231,6 +232,34 @@ esp_err_t sdcard_init_raw(sdmmc_card_t **out_card)
 uint32_t sdcard_get_current_freq_khz(void) { return s_current_freq_khz; }
 uint32_t sdcard_get_default_freq_khz(void) { return WIMILL_SD_FREQ_KHZ_DEFAULT; }
 
+bool sdcard_get_disk_status_check(void)
+{
+    bool enabled;
+    sdcard_lock();
+    enabled = s_disk_status_check;
+    sdcard_unlock();
+    return enabled;
+}
+
+esp_err_t sdcard_set_disk_status_check(bool enable, bool remount)
+{
+    sdcard_lock();
+    s_disk_status_check = enable;
+    sdcard_unlock();
+
+    if (!remount) {
+        return ESP_OK;
+    }
+    if (sdcard_is_mounted()) {
+        esp_err_t ret = sdcard_unmount();
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        return sdcard_mount();
+    }
+    return ESP_OK;
+}
+
 esp_err_t sdcard_set_frequency(uint32_t freq_khz, bool remount)
 {
     sdcard_lock();
@@ -295,7 +324,7 @@ esp_err_t sdcard_mount(void)
         .format_if_mount_failed = false,
         .max_files = 5,
         .allocation_unit_size = DEFAULT_ALLOC_UNIT,
-        .disk_status_check_enable = true,
+        .disk_status_check_enable = s_disk_status_check,
     };
 
     ret = esp_vfs_fat_sdspi_mount(WIMILL_SD_MOUNT_POINT, &host, &slot_config, &mount_config, &s_card);
