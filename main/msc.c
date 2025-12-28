@@ -19,6 +19,8 @@
 
 #define TAG "MSC"
 #define MSC_SECTOR_SIZE 512
+#define MSC_CACHE_SECTORS 8
+#define MSC_CACHE_SIZE (MSC_SECTOR_SIZE * MSC_CACHE_SECTORS)
 #define MSC_DETACH_DELAY_MS 500
 
 // --- USB DESCRIPTORS (MANUAL) ---
@@ -66,8 +68,8 @@ typedef struct
 {
     bool valid;
     bool dirty;
-    uint32_t lba;
-    uint8_t data[MSC_SECTOR_SIZE] __attribute__((aligned(4)));
+    uint32_t base_lba;
+    uint8_t data[MSC_CACHE_SIZE] __attribute__((aligned(4)));
 } sector_cache_t;
 
 static sdmmc_card_t *s_card = NULL;
@@ -151,12 +153,44 @@ static void set_state(msc_state_t st)
     }
 }
 
+static inline bool cache_contains_lba(uint32_t lba)
+{
+    return s_cache.valid &&
+           lba >= s_cache.base_lba &&
+           lba < (s_cache.base_lba + MSC_CACHE_SECTORS);
+}
+
+static inline bool cache_contains_range(uint32_t lba, uint32_t sectors)
+{
+    if (!s_cache.valid) {
+        return false;
+    }
+    uint32_t end = lba + sectors;
+    uint32_t cache_end = s_cache.base_lba + MSC_CACHE_SECTORS;
+    return lba >= s_cache.base_lba && end <= cache_end;
+}
+
+static inline bool cache_overlaps_range(uint32_t lba, uint32_t sectors)
+{
+    if (!s_cache.valid) {
+        return false;
+    }
+    uint32_t end = lba + sectors;
+    uint32_t cache_end = s_cache.base_lba + MSC_CACHE_SECTORS;
+    return !(end <= s_cache.base_lba || lba >= cache_end);
+}
+
+static inline uint32_t cache_base_lba(uint32_t lba)
+{
+    return (lba / MSC_CACHE_SECTORS) * MSC_CACHE_SECTORS;
+}
+
 static esp_err_t flush_cache_locked(void)
 {
     if (!s_cache.valid || !s_cache.dirty)
         return ESP_OK;
     stats_record_flush();
-    esp_err_t ret = sdmmc_write_sectors(s_card, s_cache.data, s_cache.lba, 1);
+    esp_err_t ret = sdmmc_write_sectors(s_card, s_cache.data, s_cache.base_lba, MSC_CACHE_SECTORS);
     if (ret == ESP_OK)
         s_cache.dirty = false;
     return ret;
@@ -164,15 +198,16 @@ static esp_err_t flush_cache_locked(void)
 
 static esp_err_t load_cache_locked(uint32_t lba)
 {
-    if (s_cache.valid && s_cache.lba == lba)
+    uint32_t base = cache_base_lba(lba);
+    if (s_cache.valid && s_cache.base_lba == base)
         return ESP_OK;
     ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
-    esp_err_t ret = sdmmc_read_sectors(s_card, s_cache.data, lba, 1);
+    esp_err_t ret = sdmmc_read_sectors(s_card, s_cache.data, base, MSC_CACHE_SECTORS);
     if (ret != ESP_OK)
         return ret;
     s_cache.valid = true;
     s_cache.dirty = false;
-    s_cache.lba = lba;
+    s_cache.base_lba = base;
     return ESP_OK;
 }
 
@@ -183,7 +218,12 @@ static esp_err_t msc_read_partial(uint32_t lba, uint32_t offset, uint8_t *buffer
     if ((offset + bufsize) > s_block_size)
         return ESP_ERR_INVALID_ARG;
     ESP_RETURN_ON_ERROR(load_cache_locked(lba), TAG, "load failed");
-    memcpy(buffer, s_cache.data + offset, bufsize);
+    if (!cache_contains_lba(lba)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint32_t sector_index = lba - s_cache.base_lba;
+    uint32_t cache_offset = sector_index * MSC_SECTOR_SIZE + offset;
+    memcpy(buffer, s_cache.data + cache_offset, bufsize);
     return ESP_OK;
 }
 
@@ -193,12 +233,13 @@ static esp_err_t msc_write_partial(uint32_t lba, uint32_t offset, const uint8_t 
         return ESP_ERR_INVALID_STATE;
     if ((offset + bufsize) > s_block_size)
         return ESP_ERR_INVALID_ARG;
-    if (s_cache.valid && s_cache.dirty && s_cache.lba != lba)
-    {
-        ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
-    }
     ESP_RETURN_ON_ERROR(load_cache_locked(lba), TAG, "load failed");
-    memcpy(s_cache.data + offset, buffer, bufsize);
+    if (!cache_contains_lba(lba)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint32_t sector_index = lba - s_cache.base_lba;
+    uint32_t cache_offset = sector_index * MSC_SECTOR_SIZE + offset;
+    memcpy(s_cache.data + cache_offset, buffer, bufsize);
     s_cache.dirty = true;
     return ESP_OK;
 }
@@ -383,10 +424,17 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
     // Fast Path (Optimized)
     if (fast)
     {
-        if (s_cache.valid && s_cache.dirty)
-            flush_cache_locked();
         uint32_t sectors = bufsize / s_block_size;
-        ret = sdmmc_read_sectors(s_card, buffer, lba, sectors);
+        if (s_cache.dirty && cache_contains_range(lba, sectors)) {
+            uint32_t cache_offset = (lba - s_cache.base_lba) * MSC_SECTOR_SIZE;
+            memcpy(buffer, s_cache.data + cache_offset, bufsize);
+            ret = ESP_OK;
+        } else {
+            if (s_cache.dirty && cache_overlaps_range(lba, sectors)) {
+                ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
+            }
+            ret = sdmmc_read_sectors(s_card, buffer, lba, sectors);
+        }
     }
     else
     {
@@ -415,15 +463,22 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
     // Fast Path (Optimized)
     if (fast)
     {
-        if (s_cache.valid && s_cache.dirty)
-            flush_cache_locked();
         uint32_t sectors = bufsize / s_block_size;
-        // Инвалидация кэша, если пишем поверх него
-        if (s_cache.valid && s_cache.lba >= lba && s_cache.lba < (lba + sectors))
-        {
-            s_cache.valid = false;
+        if (s_cache.valid && cache_contains_range(lba, sectors)) {
+            uint32_t cache_offset = (lba - s_cache.base_lba) * MSC_SECTOR_SIZE;
+            memcpy(s_cache.data + cache_offset, buffer, bufsize);
+            s_cache.dirty = true;
+            ret = ESP_OK;
+        } else {
+            if (s_cache.dirty && cache_overlaps_range(lba, sectors)) {
+                ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
+            }
+            if (s_cache.valid && cache_overlaps_range(lba, sectors)) {
+                s_cache.valid = false;
+                s_cache.dirty = false;
+            }
+            ret = sdmmc_write_sectors(s_card, buffer, lba, sectors);
         }
-        ret = sdmmc_write_sectors(s_card, buffer, lba, sectors);
     }
     else
     {
