@@ -19,7 +19,7 @@
 
 #define TAG "MSC"
 #define MSC_SECTOR_SIZE 512
-#define MSC_CACHE_SECTORS 8
+#define MSC_CACHE_SECTORS 64
 #define MSC_CACHE_SIZE (MSC_SECTOR_SIZE * MSC_CACHE_SECTORS)
 #define MSC_DETACH_DELAY_MS 500
 
@@ -121,6 +121,13 @@ static void stats_record_flush(void)
 {
     portENTER_CRITICAL(&s_stats_mux);
     s_stats.cache_flushes++;
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+static void stats_record_miss(void)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats.cache_misses++;
     portEXIT_CRITICAL(&s_stats_mux);
 }
 
@@ -430,6 +437,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
             memcpy(buffer, s_cache.data + cache_offset, bufsize);
             ret = ESP_OK;
         } else {
+            stats_record_miss();
             if (s_cache.dirty && cache_overlaps_range(lba, sectors)) {
                 ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
             }
@@ -470,6 +478,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
             s_cache.dirty = true;
             ret = ESP_OK;
         } else {
+            stats_record_miss();
             if (s_cache.dirty && cache_overlaps_range(lba, sectors)) {
                 ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
             }

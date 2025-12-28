@@ -527,7 +527,7 @@ static void handle_usb(int argc, char *argv[])
         ESP_LOGI(TAG, "MSC write: fast=%u partial=%u avg=%u min=%u max=%u",
                  stats.write_fast_calls, stats.write_partial_calls,
                  write_avg, stats.write_buf_min, stats.write_buf_max);
-        ESP_LOGI(TAG, "MSC cache flushes: %u", stats.cache_flushes);
+        ESP_LOGI(TAG, "MSC cache: flushes=%u misses=%u", stats.cache_flushes, stats.cache_misses);
         return;
     }
 

@@ -23,6 +23,7 @@ typedef struct {
     uint32_t write_buf_min;
     uint32_t write_buf_max;
     uint32_t cache_flushes;
+    uint32_t cache_misses;
 } msc_stats_t;
 
 esp_err_t msc_init(void);
