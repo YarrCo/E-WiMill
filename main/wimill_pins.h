@@ -1,10 +1,10 @@
 #pragma once
 
 // SPI wiring for SD card (SDSPI mode)
-#define WIMILL_PIN_SD_CS   13
-#define WIMILL_PIN_SD_MOSI 16
-#define WIMILL_PIN_SD_SCK  15
-#define WIMILL_PIN_SD_MISO 17
+#define WIMILL_PIN_SD_CS   10
+#define WIMILL_PIN_SD_MOSI 11
+#define WIMILL_PIN_SD_SCK  12
+#define WIMILL_PIN_SD_MISO 13
 
 // Default UART console speed
 #define WIMILL_UART_BAUD 115200
