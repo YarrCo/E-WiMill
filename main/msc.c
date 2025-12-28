@@ -277,6 +277,26 @@ static esp_err_t cache_ensure_sector_full(uint32_t lba)
     return ESP_OK;
 }
 
+static void msc_prefetch_cache(void)
+{
+    if (!s_card) {
+        return;
+    }
+    esp_err_t ret = sdmmc_read_sectors(s_card, s_cache.data, 0, MSC_CACHE_SECTORS);
+    if (ret != ESP_OK) {
+        s_cache.valid = false;
+        s_cache.dirty = false;
+        cache_masks_set_all(0);
+        ESP_LOGW(TAG, "Prefetch failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    s_cache.valid = true;
+    s_cache.dirty = false;
+    s_cache.base_lba = 0;
+    cache_masks_set_all(MSC_SUBSECTOR_MASK_FULL);
+    ESP_LOGI(TAG, "Prefetch OK: %u sectors", (unsigned)MSC_CACHE_SECTORS);
+}
+
 static esp_err_t flush_cache_locked(void)
 {
     if (!s_cache.valid || !s_cache.dirty)
@@ -397,6 +417,7 @@ static esp_err_t msc_enable(void)
     s_block_count = s_card->csd.capacity; // Без умножения!
 
     memset(&s_cache, 0, sizeof(s_cache));
+    msc_prefetch_cache();
 
     // !!! ИСПРАВЛЕНИЕ 2: Ручные дескрипторы !!!
     tinyusb_config_t tusb_cfg = {
