@@ -76,6 +76,51 @@ static uint32_t s_block_count = 0;
 static bool s_usb_enabled = false;
 static msc_state_t s_state = MSC_STATE_USB_DETACHED;
 static sector_cache_t s_cache = {0};
+static msc_stats_t s_stats = {0};
+static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void stats_record_read(uint32_t bufsize, bool fast)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats.read_bytes += bufsize;
+    if (fast) {
+        s_stats.read_fast_calls++;
+    } else {
+        s_stats.read_partial_calls++;
+    }
+    if (s_stats.read_buf_min == 0 || bufsize < s_stats.read_buf_min) {
+        s_stats.read_buf_min = bufsize;
+    }
+    if (bufsize > s_stats.read_buf_max) {
+        s_stats.read_buf_max = bufsize;
+    }
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+static void stats_record_write(uint32_t bufsize, bool fast)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats.write_bytes += bufsize;
+    if (fast) {
+        s_stats.write_fast_calls++;
+    } else {
+        s_stats.write_partial_calls++;
+    }
+    if (s_stats.write_buf_min == 0 || bufsize < s_stats.write_buf_min) {
+        s_stats.write_buf_min = bufsize;
+    }
+    if (bufsize > s_stats.write_buf_max) {
+        s_stats.write_buf_max = bufsize;
+    }
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+static void stats_record_flush(void)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats.cache_flushes++;
+    portEXIT_CRITICAL(&s_stats_mux);
+}
 
 static inline void lock_io(void)
 {
@@ -110,6 +155,7 @@ static esp_err_t flush_cache_locked(void)
 {
     if (!s_cache.valid || !s_cache.dirty)
         return ESP_OK;
+    stats_record_flush();
     esp_err_t ret = sdmmc_write_sectors(s_card, s_cache.data, s_cache.lba, 1);
     if (ret == ESP_OK)
         s_cache.dirty = false;
@@ -245,6 +291,23 @@ bool msc_is_host_connected(void)
     return s_usb_enabled && tud_mounted();
 }
 
+void msc_stats_get(msc_stats_t *out_stats)
+{
+    if (!out_stats) {
+        return;
+    }
+    portENTER_CRITICAL(&s_stats_mux);
+    *out_stats = s_stats;
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+void msc_stats_reset(void)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    memset(&s_stats, 0, sizeof(s_stats));
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
 esp_err_t msc_attach(void)
 {
     if (s_state == MSC_STATE_USB_ATTACHED)
@@ -315,9 +378,10 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
         return -1;
     lock_io();
     esp_err_t ret = ESP_OK;
+    bool fast = (offset == 0 && (bufsize % s_block_size) == 0);
 
     // Fast Path (Optimized)
-    if (offset == 0 && (bufsize % s_block_size) == 0)
+    if (fast)
     {
         if (s_cache.valid && s_cache.dirty)
             flush_cache_locked();
@@ -329,6 +393,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
         ret = msc_read_partial(lba, offset, buffer, bufsize);
     }
     unlock_io();
+    stats_record_read(bufsize, fast);
 
     if (ret != ESP_OK)
     {
@@ -345,9 +410,10 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
         return -1;
     lock_io();
     esp_err_t ret = ESP_OK;
+    bool fast = (offset == 0 && (bufsize % s_block_size) == 0);
 
     // Fast Path (Optimized)
-    if (offset == 0 && (bufsize % s_block_size) == 0)
+    if (fast)
     {
         if (s_cache.valid && s_cache.dirty)
             flush_cache_locked();
@@ -364,6 +430,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
         ret = msc_write_partial(lba, offset, buffer, bufsize);
     }
     unlock_io();
+    stats_record_write(bufsize, fast);
 
     if (ret != ESP_OK)
     {

@@ -85,7 +85,7 @@ void cli_print_help(void)
     printf("  sdbench [mb] [buf N] - write+read speed test (queued)\n");
     printf("  sd freq [kHz]       - show/set SD SPI freq (20000..40000)\n");
     printf("  sd check [0|1]      - disk status check (remount)\n");
-    printf("  usb status|attach|detach  - manage MSC state\n");
+    printf("  usb status|attach|detach|stats  - manage MSC state\n");
 }
 
 static void print_prompt(void)
@@ -495,13 +495,39 @@ static void handle_sdbench(int argc, char *argv[])
 static void handle_usb(int argc, char *argv[])
 {
     if (argc < 2) {
-        ESP_LOGW(TAG, "Usage: usb status|attach|detach");
+        ESP_LOGW(TAG, "Usage: usb status|attach|detach|stats");
         return;
     }
     const char *sub = argv[1];
     if (strcmp(sub, "status") == 0) {
         ESP_LOGI(TAG, "USB=%s, VFS=%s", msc_state_str(msc_get_state()),
                  sdcard_is_mounted() ? "mounted" : "unmounted");
+        return;
+    }
+
+    if (strcmp(sub, "stats") == 0) {
+        if (argc >= 3 && strcmp(argv[2], "reset") == 0) {
+            msc_stats_reset();
+            ESP_LOGI(TAG, "MSC stats reset");
+            return;
+        }
+        msc_stats_t stats = {0};
+        msc_stats_get(&stats);
+        uint32_t read_calls = stats.read_fast_calls + stats.read_partial_calls;
+        uint32_t write_calls = stats.write_fast_calls + stats.write_partial_calls;
+        uint32_t read_avg = read_calls ? (uint32_t)(stats.read_bytes / read_calls) : 0;
+        uint32_t write_avg = write_calls ? (uint32_t)(stats.write_bytes / write_calls) : 0;
+
+        ESP_LOGI(TAG, "MSC bytes: read=%llu write=%llu",
+                 (unsigned long long)stats.read_bytes,
+                 (unsigned long long)stats.write_bytes);
+        ESP_LOGI(TAG, "MSC read: fast=%u partial=%u avg=%u min=%u max=%u",
+                 stats.read_fast_calls, stats.read_partial_calls,
+                 read_avg, stats.read_buf_min, stats.read_buf_max);
+        ESP_LOGI(TAG, "MSC write: fast=%u partial=%u avg=%u min=%u max=%u",
+                 stats.write_fast_calls, stats.write_partial_calls,
+                 write_avg, stats.write_buf_min, stats.write_buf_max);
+        ESP_LOGI(TAG, "MSC cache flushes: %u", stats.cache_flushes);
         return;
     }
 
