@@ -26,6 +26,8 @@
 #define CLI_DEFAULT_CAT_BYTES 256
 #define CLI_DEFAULT_SDTEST_MB 10
 #define CLI_DEFAULT_SDTEST_BUF WIMILL_SDTEST_BUF_SZ
+#define CLI_DEFAULT_SDBENCH_MB 1
+#define CLI_DEFAULT_SDBENCH_BUF 4096
 
 #define FILEOP_QUEUE_LEN 4
 #define FILEOP_TASK_STACK 4096
@@ -34,6 +36,7 @@
 typedef enum {
     FILEOP_TOUCH,
     FILEOP_SDTEST,
+    FILEOP_SDBENCH,
 } fileop_type_t;
 
 typedef struct {
@@ -79,6 +82,7 @@ void cli_print_help(void)
     printf("  cat <name>          - show first %d bytes (hex+ascii)\n", CLI_DEFAULT_CAT_BYTES);
     printf("  touch <name> <n>    - create file with n zero bytes (queued)\n");
     printf("  sdtest [mb] [kHz] [buf N] - write+verify file (queued)\n");
+    printf("  sdbench [mb] [buf N] - write+read speed test (queued)\n");
     printf("  sd freq [kHz]       - show/set SD SPI freq (20000..40000)\n");
     printf("  usb status|attach|detach  - manage MSC state\n");
 }
@@ -147,6 +151,12 @@ static void fileop_task(void *arg)
                      (unsigned)op.size_mb, (unsigned)op.freq_khz, (unsigned)op.buf_bytes);
             esp_err_t err = sdcard_self_test(op.size_mb, op.freq_khz, op.buf_bytes);
             ESP_LOGI(TAG, "sdtest done: %s", esp_err_to_name(err));
+            break;
+        }
+        case FILEOP_SDBENCH: {
+            ESP_LOGI(TAG, "sdbench start: %u MB, buf=%u", (unsigned)op.size_mb, (unsigned)op.buf_bytes);
+            esp_err_t err = sdcard_bench(op.size_mb, op.buf_bytes);
+            ESP_LOGI(TAG, "sdbench done: %s", esp_err_to_name(err));
             break;
         }
         default:
@@ -412,6 +422,53 @@ static void handle_sdtest(int argc, char *argv[])
     ESP_LOGI(TAG, "sdtest queued");
 }
 
+static void handle_sdbench(int argc, char *argv[])
+{
+    if (!ensure_vfs_ready()) {
+        return;
+    }
+    size_t size_mb = CLI_DEFAULT_SDBENCH_MB;
+    size_t buf_bytes = CLI_DEFAULT_SDBENCH_BUF;
+    bool size_set = false;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "buf") == 0 && (i + 1) < argc) {
+            long v = strtol(argv[i + 1], NULL, 10);
+            if (v > 0) {
+                buf_bytes = (size_t)v;
+            } else {
+                ESP_LOGW(TAG, "Invalid buf size: %s", argv[i + 1]);
+            }
+            ++i;
+            continue;
+        }
+
+        char *end = NULL;
+        long v = strtol(argv[i], &end, 10);
+        if (end != argv[i] && v > 0) {
+            if (!size_set) {
+                size_mb = (size_t)v;
+                size_set = true;
+            }
+        }
+    }
+
+    fileop_t op = {0};
+    op.type = FILEOP_SDBENCH;
+    op.size_mb = size_mb;
+    op.buf_bytes = buf_bytes;
+
+    if (!s_fileop_queue) {
+        ESP_LOGW(TAG, "File-op queue not ready");
+        return;
+    }
+    if (xQueueSend(s_fileop_queue, &op, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "File-op queue full");
+        return;
+    }
+    ESP_LOGI(TAG, "sdbench queued");
+}
+
 static void handle_usb(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -481,6 +538,8 @@ static void execute_command(int argc, char *argv[])
         handle_sd_freq(argc, argv);
     } else if (strcmp(cmd, "sdtest") == 0) {
         handle_sdtest(argc, argv);
+    } else if (strcmp(cmd, "sdbench") == 0) {
+        handle_sdbench(argc, argv);
     } else if (strcmp(cmd, "usb") == 0) {
         handle_usb(argc, argv);
     } else {

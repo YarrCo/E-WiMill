@@ -24,6 +24,7 @@
 #define TAG "SDCARD"
 #define DEFAULT_ALLOC_UNIT (32 * 1024)
 #define SDTEST_FILE_PATH "/sdcard/.wimill_sdtest.bin"
+#define SDBENCH_FILE_PATH "/sdcard/.wimill_bench.bin"
 #define SDTEST_BLOCK_MIN 4096
 #define SDSPI_MAX_TRANSFER (8 * 1024)
 
@@ -706,6 +707,97 @@ esp_err_t sdcard_self_test(size_t size_mb, uint32_t freq_khz, size_t buf_bytes)
 
     heap_caps_free(io_buf);
     heap_caps_free(exp_buf);
+    sdcard_unlock();
+    return ESP_OK;
+}
+
+esp_err_t sdcard_bench(size_t size_mb, size_t buf_bytes)
+{
+    if (size_mb == 0) {
+        size_mb = 1;
+    }
+    sdcard_lock();
+    if (!vfs_allowed_locked() || !s_mounted) {
+        sdcard_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (buf_bytes < 512) {
+        buf_bytes = 512;
+    }
+
+    size_t total_bytes = size_mb * 1024 * 1024;
+    if (size_mb != 0 && total_bytes / (1024 * 1024) != size_mb) {
+        sdcard_unlock();
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t *io_buf = heap_caps_malloc(buf_bytes, MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+    if (!io_buf) {
+        sdcard_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    memset(io_buf, 'A', buf_bytes);
+
+    FILE *f = fopen(SDBENCH_FILE_PATH, "wb");
+    if (!f) {
+        heap_caps_free(io_buf);
+        sdcard_unlock();
+        return ESP_FAIL;
+    }
+
+    size_t written_total = 0;
+    int fd = fileno(f);
+    int64_t write_start = esp_timer_get_time();
+    while (written_total < total_bytes) {
+        size_t to_write = (total_bytes - written_total) > buf_bytes ? buf_bytes : (total_bytes - written_total);
+        size_t wrote = fwrite(io_buf, 1, to_write, f);
+        if (wrote != to_write || ferror(f)) {
+            fclose(f);
+            heap_caps_free(io_buf);
+            sdcard_unlock();
+            return ESP_FAIL;
+        }
+        written_total += wrote;
+        vTaskDelay(1);
+    }
+    fflush(f);
+    fsync(fd);
+    fclose(f);
+    int64_t write_end = esp_timer_get_time();
+
+    f = fopen(SDBENCH_FILE_PATH, "rb");
+    if (!f) {
+        heap_caps_free(io_buf);
+        sdcard_unlock();
+        return ESP_FAIL;
+    }
+
+    size_t read_total = 0;
+    int64_t read_start = esp_timer_get_time();
+    while (read_total < total_bytes) {
+        size_t to_read = (total_bytes - read_total) > buf_bytes ? buf_bytes : (total_bytes - read_total);
+        size_t got = fread(io_buf, 1, to_read, f);
+        if (got != to_read || ferror(f)) {
+            fclose(f);
+            heap_caps_free(io_buf);
+            sdcard_unlock();
+            return ESP_FAIL;
+        }
+        read_total += got;
+        vTaskDelay(1);
+    }
+    fclose(f);
+    int64_t read_end = esp_timer_get_time();
+
+    double write_time_s = (double)(write_end - write_start) / 1e6;
+    double read_time_s = (double)(read_end - read_start) / 1e6;
+    double kb_total = (double)total_bytes / 1024.0;
+    ESP_LOGI(TAG, "SDBENCH size=%zu MB write=%.1f KB/s read=%.1f KB/s",
+             size_mb, kb_total / write_time_s, kb_total / read_time_s);
+    unlink(SDBENCH_FILE_PATH);
+
+    heap_caps_free(io_buf);
     sdcard_unlock();
     return ESP_OK;
 }

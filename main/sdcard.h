@@ -53,3 +53,4 @@ esp_err_t sdcard_mkdir(const char *path);
 esp_err_t sdcard_cat(const char *path, size_t max_bytes);
 esp_err_t sdcard_touch(const char *path, size_t size_bytes);
 esp_err_t sdcard_self_test(size_t size_mb, uint32_t freq_khz, size_t buf_bytes);
+esp_err_t sdcard_bench(size_t size_mb, size_t buf_bytes);
