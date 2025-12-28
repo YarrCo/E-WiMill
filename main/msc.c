@@ -285,6 +285,25 @@ static inline bool prefetch_contains(uint32_t lba, uint32_t sectors)
     return true;
 }
 
+static esp_err_t cache_ensure_slot(uint32_t lba, uint32_t *out_idx, uint8_t **out_ptr)
+{
+    if (!out_idx || !out_ptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!cache_contains_lba(lba)) {
+        if (s_cache.dirty) {
+            ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
+        }
+        s_cache.valid = true;
+        s_cache.dirty = false;
+        s_cache.base_lba = cache_base_lba(lba);
+        cache_masks_set_all(0);
+    }
+    *out_idx = lba - s_cache.base_lba;
+    *out_ptr = s_cache.data + (*out_idx) * MSC_SECTOR_SIZE;
+    return ESP_OK;
+}
+
 static esp_err_t sd_read_to_cache(uint8_t *dest, uint32_t lba, uint32_t sectors)
 {
     if (!dest || !s_dma_buf) {
@@ -444,32 +463,26 @@ static esp_err_t msc_read_partial(uint32_t lba, uint32_t offset, uint8_t *buffer
             return ESP_OK;
         }
     }
-    if (cache_contains_lba(lba)) {
-        uint32_t sector_index = lba - s_cache.base_lba;
-        if (s_cache.mask[sector_index] == MSC_SUBSECTOR_MASK_FULL) {
-            uint32_t cache_offset = sector_index * MSC_SECTOR_SIZE + offset;
-            memcpy(buffer, s_cache.data + cache_offset, bufsize);
-            return ESP_OK;
-        }
-        esp_err_t ret = sdmmc_read_sectors(s_card, s_dma_buf, lba, 1);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        uint8_t mask = s_cache.mask[sector_index];
-        uint8_t *temp = s_dma_buf;
-        uint8_t *src = s_cache.data + sector_index * MSC_SECTOR_SIZE;
-        for (uint32_t chunk = 0; chunk < MSC_SUBSECTOR_COUNT; ++chunk) {
-            if (mask & (1u << chunk)) {
-                memcpy(temp + chunk * MSC_SUBSECTOR_SIZE,
-                       src + chunk * MSC_SUBSECTOR_SIZE,
-                       MSC_SUBSECTOR_SIZE);
+    uint32_t sector_index = 0;
+    uint8_t *cache_ptr = NULL;
+    ESP_RETURN_ON_ERROR(cache_ensure_slot(lba, &sector_index, &cache_ptr), TAG, "cache slot");
+    if (s_cache.mask[sector_index] != MSC_SUBSECTOR_MASK_FULL) {
+        ESP_RETURN_ON_ERROR(sdmmc_read_sectors(s_card, s_dma_buf, lba, 1), TAG, "read failed");
+        if (s_cache.mask[sector_index] != 0) {
+            uint8_t mask = s_cache.mask[sector_index];
+            uint8_t *temp = s_dma_buf;
+            for (uint32_t chunk = 0; chunk < MSC_SUBSECTOR_COUNT; ++chunk) {
+                if (mask & (1u << chunk)) {
+                    memcpy(temp + chunk * MSC_SUBSECTOR_SIZE,
+                           cache_ptr + chunk * MSC_SUBSECTOR_SIZE,
+                           MSC_SUBSECTOR_SIZE);
+                }
             }
         }
-        memcpy(buffer, temp + offset, bufsize);
-        return ESP_OK;
+        memcpy(cache_ptr, s_dma_buf, MSC_SECTOR_SIZE);
+        s_cache.mask[sector_index] = MSC_SUBSECTOR_MASK_FULL;
     }
-    ESP_RETURN_ON_ERROR(sdmmc_read_sectors(s_card, s_dma_buf, lba, 1), TAG, "read failed");
-    memcpy(buffer, s_dma_buf + offset, bufsize);
+    memcpy(buffer, cache_ptr + offset, bufsize);
     return ESP_OK;
 }
 
