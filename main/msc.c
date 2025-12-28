@@ -19,7 +19,7 @@
 
 #define TAG "MSC"
 #define MSC_SECTOR_SIZE 512
-#define MSC_CACHE_SECTORS 64
+#define MSC_CACHE_SECTORS 128
 #define MSC_CACHE_SIZE (MSC_SECTOR_SIZE * MSC_CACHE_SECTORS)
 #define MSC_SUBSECTOR_SIZE 64
 #define MSC_SUBSECTOR_COUNT (MSC_SECTOR_SIZE / MSC_SUBSECTOR_SIZE)
@@ -342,11 +342,6 @@ static esp_err_t flush_cache_locked(void)
     }
     s_cache.dirty = false;
     return ESP_OK;
-}
-
-static esp_err_t load_cache_locked(uint32_t lba)
-{
-    return cache_load_full(lba);
 }
 
 static esp_err_t msc_read_partial(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
