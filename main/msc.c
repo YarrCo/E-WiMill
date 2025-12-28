@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -19,8 +20,9 @@
 
 #define TAG "MSC"
 #define MSC_SECTOR_SIZE 512
-#define MSC_CACHE_SECTORS 256
+#define MSC_CACHE_SECTORS 1024
 #define MSC_CACHE_SIZE (MSC_SECTOR_SIZE * MSC_CACHE_SECTORS)
+#define MSC_DMA_SECTORS 16
 #define MSC_SUBSECTOR_SIZE 64
 #define MSC_SUBSECTOR_COUNT (MSC_SECTOR_SIZE / MSC_SUBSECTOR_SIZE)
 #define MSC_SUBSECTOR_MASK_FULL ((uint8_t)((1u << MSC_SUBSECTOR_COUNT) - 1u))
@@ -72,8 +74,8 @@ typedef struct
     bool valid;
     bool dirty;
     uint32_t base_lba;
-    uint8_t data[MSC_CACHE_SIZE] __attribute__((aligned(4)));
-    uint8_t mask[MSC_CACHE_SECTORS];
+    uint8_t *data;
+    uint8_t *mask;
 } sector_cache_t;
 
 static sdmmc_card_t *s_card = NULL;
@@ -84,8 +86,33 @@ static msc_state_t s_state = MSC_STATE_USB_DETACHED;
 static sector_cache_t s_cache = {0};
 static msc_stats_t s_stats = {0};
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t *s_cache_data = NULL;
+static uint8_t *s_cache_mask = NULL;
+static uint8_t *s_dma_buf = NULL;
 
 static esp_err_t flush_cache_locked(void);
+
+static esp_err_t cache_alloc(void)
+{
+    if (s_cache_data && s_cache_mask && s_dma_buf) {
+        return ESP_OK;
+    }
+    if (!s_cache_data) {
+        s_cache_data = heap_caps_malloc(MSC_CACHE_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!s_cache_mask) {
+        s_cache_mask = heap_caps_malloc(MSC_CACHE_SECTORS, MALLOC_CAP_8BIT);
+    }
+    if (!s_dma_buf) {
+        s_dma_buf = heap_caps_malloc(MSC_DMA_SECTORS * MSC_SECTOR_SIZE,
+                                     MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    }
+    if (!s_cache_data || !s_cache_mask || !s_dma_buf) {
+        ESP_LOGE(TAG, "MSC cache alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
 
 static void stats_record_read(uint32_t bufsize, bool fast)
 {
@@ -214,7 +241,51 @@ static inline uint32_t cache_base_lba(uint32_t lba)
 
 static inline void cache_masks_set_all(uint8_t value)
 {
-    memset(s_cache.mask, value, sizeof(s_cache.mask));
+    if (s_cache.mask) {
+        memset(s_cache.mask, value, MSC_CACHE_SECTORS);
+    }
+}
+
+static esp_err_t sd_read_to_cache(uint8_t *dest, uint32_t lba, uint32_t sectors)
+{
+    if (!dest || !s_dma_buf) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    size_t offset = 0;
+    uint32_t remain = sectors;
+    while (remain > 0) {
+        uint32_t chunk = remain > MSC_DMA_SECTORS ? MSC_DMA_SECTORS : remain;
+        esp_err_t ret = sdmmc_read_sectors(s_card, s_dma_buf, lba, chunk);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        memcpy(dest + offset, s_dma_buf, chunk * MSC_SECTOR_SIZE);
+        lba += chunk;
+        remain -= chunk;
+        offset += chunk * MSC_SECTOR_SIZE;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t sd_write_from_cache(const uint8_t *src, uint32_t lba, uint32_t sectors)
+{
+    if (!src || !s_dma_buf) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    size_t offset = 0;
+    uint32_t remain = sectors;
+    while (remain > 0) {
+        uint32_t chunk = remain > MSC_DMA_SECTORS ? MSC_DMA_SECTORS : remain;
+        memcpy(s_dma_buf, src + offset, chunk * MSC_SECTOR_SIZE);
+        esp_err_t ret = sdmmc_write_sectors(s_card, s_dma_buf, lba, chunk);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        lba += chunk;
+        remain -= chunk;
+        offset += chunk * MSC_SECTOR_SIZE;
+    }
+    return ESP_OK;
 }
 
 static esp_err_t cache_prepare_for_write(uint32_t lba)
@@ -238,7 +309,7 @@ static esp_err_t cache_load_full(uint32_t lba)
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
-    esp_err_t ret = sdmmc_read_sectors(s_card, s_cache.data, base, MSC_CACHE_SECTORS);
+    esp_err_t ret = sd_read_to_cache(s_cache.data, base, MSC_CACHE_SECTORS);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -258,12 +329,12 @@ static esp_err_t cache_ensure_sector_full(uint32_t lba)
     if (s_cache.mask[idx] == MSC_SUBSECTOR_MASK_FULL) {
         return ESP_OK;
     }
-    uint8_t temp[MSC_SECTOR_SIZE];
-    esp_err_t ret = sdmmc_read_sectors(s_card, temp, lba, 1);
+    esp_err_t ret = sdmmc_read_sectors(s_card, s_dma_buf, lba, 1);
     if (ret != ESP_OK) {
         return ret;
     }
     uint8_t mask = s_cache.mask[idx];
+    uint8_t *temp = s_dma_buf;
     uint8_t *src = s_cache.data + idx * MSC_SECTOR_SIZE;
     for (uint32_t chunk = 0; chunk < MSC_SUBSECTOR_COUNT; ++chunk) {
         if (mask & (1u << chunk)) {
@@ -282,7 +353,7 @@ static void msc_prefetch_cache(void)
     if (!s_card) {
         return;
     }
-    esp_err_t ret = sdmmc_read_sectors(s_card, s_cache.data, 0, MSC_CACHE_SECTORS);
+    esp_err_t ret = sd_read_to_cache(s_cache.data, 0, MSC_CACHE_SECTORS);
     if (ret != ESP_OK) {
         s_cache.valid = false;
         s_cache.dirty = false;
@@ -320,7 +391,7 @@ static esp_err_t flush_cache_locked(void)
     }
 
     if (all_full) {
-        esp_err_t ret = sdmmc_write_sectors(s_card, s_cache.data, s_cache.base_lba, MSC_CACHE_SECTORS);
+        esp_err_t ret = sd_write_from_cache(s_cache.data, s_cache.base_lba, MSC_CACHE_SECTORS);
         if (ret == ESP_OK) {
             s_cache.dirty = false;
         }
@@ -334,18 +405,18 @@ static esp_err_t flush_cache_locked(void)
         }
         uint8_t *sector_ptr = s_cache.data + i * MSC_SECTOR_SIZE;
         if (mask == MSC_SUBSECTOR_MASK_FULL) {
-            esp_err_t ret = sdmmc_write_sectors(s_card, sector_ptr, s_cache.base_lba + i, 1);
+            esp_err_t ret = sd_write_from_cache(sector_ptr, s_cache.base_lba + i, 1);
             if (ret != ESP_OK) {
                 return ret;
             }
             continue;
         }
 
-        uint8_t temp[MSC_SECTOR_SIZE];
-        esp_err_t ret = sdmmc_read_sectors(s_card, temp, s_cache.base_lba + i, 1);
+        esp_err_t ret = sdmmc_read_sectors(s_card, s_dma_buf, s_cache.base_lba + i, 1);
         if (ret != ESP_OK) {
             return ret;
         }
+        uint8_t *temp = s_dma_buf;
         for (uint32_t chunk = 0; chunk < MSC_SUBSECTOR_COUNT; ++chunk) {
             if (mask & (1u << chunk)) {
                 memcpy(temp + chunk * MSC_SUBSECTOR_SIZE,
@@ -416,7 +487,11 @@ static esp_err_t msc_enable(void)
     s_block_size = s_card->csd.sector_size;
     s_block_count = s_card->csd.capacity; // Без умножения!
 
+    ESP_RETURN_ON_ERROR(cache_alloc(), TAG, "cache alloc failed");
     memset(&s_cache, 0, sizeof(s_cache));
+    s_cache.data = s_cache_data;
+    s_cache.mask = s_cache_mask;
+    cache_masks_set_all(0);
     msc_prefetch_cache();
 
     // !!! ИСПРАВЛЕНИЕ 2: Ручные дескрипторы !!!
