@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -16,10 +17,11 @@
 #include "sdcard.h"
 
 #define TAG "WEBFS"
-#define FILE_BUF_SIZE 2048
-#define UPLOAD_HEADER_SIZE 8192
-#define UPLOAD_TAIL_SIZE 96
+#define FILE_BUF_SIZE 8192
+#define UPLOAD_HEADER_SIZE 16384
+#define UPLOAD_TAIL_SIZE 128
 #define UPLOAD_WORK_SIZE (FILE_BUF_SIZE + UPLOAD_TAIL_SIZE)
+#define UPLOAD_COALESCE_SIZE (256 * 1024)
 #define MAX_QUERY_LEN 128
 #define MAX_PATH_LEN 256
 #define MAX_NAME_LEN 96
@@ -30,6 +32,49 @@ static char s_upload_header[UPLOAD_HEADER_SIZE];
 static char s_upload_buf[FILE_BUF_SIZE];
 static char s_upload_work[UPLOAD_WORK_SIZE];
 static char s_upload_tail[UPLOAD_TAIL_SIZE];
+static char s_upload_file_buf[FILE_BUF_SIZE];
+
+static bool upload_write_chunk(FILE *fp, uint8_t *coalesce_buf, size_t *coalesce_len,
+                               const uint8_t *data, size_t len)
+{
+    if (!fp || !data || len == 0) {
+        return true;
+    }
+    if (!coalesce_buf || !coalesce_len) {
+        return fwrite(data, 1, len, fp) == len;
+    }
+    size_t offset = 0;
+    while (offset < len) {
+        size_t space = UPLOAD_COALESCE_SIZE - *coalesce_len;
+        size_t chunk = (len - offset) < space ? (len - offset) : space;
+        memcpy(coalesce_buf + *coalesce_len, data + offset, chunk);
+        *coalesce_len += chunk;
+        offset += chunk;
+        if (*coalesce_len == UPLOAD_COALESCE_SIZE) {
+            if (fwrite(coalesce_buf, 1, *coalesce_len, fp) != *coalesce_len) {
+                return false;
+            }
+            *coalesce_len = 0;
+        }
+    }
+    return true;
+}
+
+static bool upload_flush_chunk(FILE *fp, uint8_t *coalesce_buf, size_t *coalesce_len)
+{
+    if (!fp || !coalesce_buf || !coalesce_len) {
+        return true;
+    }
+    if (*coalesce_len == 0) {
+        return true;
+    }
+    size_t to_write = *coalesce_len;
+    if (fwrite(coalesce_buf, 1, to_write, fp) != to_write) {
+        return false;
+    }
+    *coalesce_len = 0;
+    return true;
+}
 
 static void send_json_error(httpd_req_t *req, const char *status, const char *json)
 {
@@ -690,6 +735,9 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
                 send_json_error(req, "500 Internal Server Error", "{\"error\":\"OPEN_FAIL\"}");
                 goto cleanup;
             }
+            setvbuf(fp, s_upload_file_buf, _IOFBF, sizeof(s_upload_file_buf));
+            uint8_t *coalesce_buf = heap_caps_malloc(UPLOAD_COALESCE_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            size_t coalesce_len = 0;
 
             char boundary_marker[80];
             snprintf(boundary_marker, sizeof(boundary_marker), "\r\n--%s", boundary);
@@ -751,14 +799,32 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
                 if (pos) {
                     size_t data_bytes = (size_t)(pos - work);
                     if (data_bytes > 0) {
-                        fwrite(work, 1, data_bytes, fp);
+                        if (!upload_write_chunk(fp, coalesce_buf, &coalesce_len,
+                                                (const uint8_t *)work, data_bytes)) {
+                            fclose(fp);
+                            if (coalesce_buf) {
+                                heap_caps_free(coalesce_buf);
+                            }
+                            unlink(tmp_path);
+                            send_json_error(req, "500 Internal Server Error", "{\"error\":\"WRITE_FAIL\"}");
+                            goto cleanup;
+                        }
                     }
                     done = true;
                 } else {
                     size_t keep = marker_len > 1 ? marker_len - 1 : 0;
                     if (work_len > keep) {
                         size_t write_len = work_len - keep;
-                        fwrite(work, 1, write_len, fp);
+                        if (!upload_write_chunk(fp, coalesce_buf, &coalesce_len,
+                                                (const uint8_t *)work, write_len)) {
+                            fclose(fp);
+                            if (coalesce_buf) {
+                                heap_caps_free(coalesce_buf);
+                            }
+                            unlink(tmp_path);
+                            send_json_error(req, "500 Internal Server Error", "{\"error\":\"WRITE_FAIL\"}");
+                            goto cleanup;
+                        }
                         if (keep > 0) {
                             memcpy(tail, work + write_len, keep);
                             tail_len = keep;
@@ -785,9 +851,21 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
                 remaining -= d;
             }
 
+            if (!upload_flush_chunk(fp, coalesce_buf, &coalesce_len)) {
+                fclose(fp);
+                if (coalesce_buf) {
+                    heap_caps_free(coalesce_buf);
+                }
+                unlink(tmp_path);
+                send_json_error(req, "500 Internal Server Error", "{\"error\":\"WRITE_FAIL\"}");
+                goto cleanup;
+            }
             fflush(fp);
             fsync(fileno(fp));
             fclose(fp);
+            if (coalesce_buf) {
+                heap_caps_free(coalesce_buf);
+            }
 
             if (rename(tmp_path, full_path) != 0) {
                 unlink(tmp_path);

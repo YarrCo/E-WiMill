@@ -337,6 +337,14 @@ static esp_err_t setup_wifi_init_base(void)
             return err;
         s_wifi_inited = true;
     }
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(TAG, "wifi ps disable failed: %s", esp_err_to_name(err));
+    }
+    err = esp_wifi_set_max_tx_power(78);
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(TAG, "wifi tx power set failed: %s", esp_err_to_name(err));
+    }
     if (!s_handlers_registered)
     {
         esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
@@ -373,6 +381,8 @@ static esp_err_t setup_wifi_start(void)
     err = esp_wifi_set_mode(WIFI_MODE_AP);
     if (err != ESP_OK)
         return err;
+    esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT40);
     err = esp_wifi_set_config(WIFI_IF_AP, &s_ap_cfg);
     if (err != ESP_OK)
         return err;
@@ -456,6 +466,8 @@ static esp_err_t sta_connect_start(void)
         if (start_err != ESP_OK && start_err != ESP_ERR_WIFI_CONN && start_err != ESP_ERR_INVALID_STATE)
             return start_err;
     }
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
     esp_wifi_disconnect();
     err = esp_wifi_connect();
     if (err != ESP_OK)
