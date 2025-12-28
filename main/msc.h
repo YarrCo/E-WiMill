@@ -24,6 +24,10 @@ typedef struct {
     uint32_t write_buf_max;
     uint32_t cache_flushes;
     uint32_t cache_misses;
+    uint32_t read_lba_min;
+    uint32_t read_lba_max;
+    uint32_t write_lba_min;
+    uint32_t write_lba_max;
 } msc_stats_t;
 
 esp_err_t msc_init(void);

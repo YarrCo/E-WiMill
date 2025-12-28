@@ -114,7 +114,7 @@ static esp_err_t cache_alloc(void)
     return ESP_OK;
 }
 
-static void stats_record_read(uint32_t bufsize, bool fast)
+static void stats_record_read(uint32_t lba, uint32_t bufsize, bool fast)
 {
     portENTER_CRITICAL(&s_stats_mux);
     s_stats.read_bytes += bufsize;
@@ -129,10 +129,16 @@ static void stats_record_read(uint32_t bufsize, bool fast)
     if (bufsize > s_stats.read_buf_max) {
         s_stats.read_buf_max = bufsize;
     }
+    if (s_stats.read_lba_min == 0 || lba < s_stats.read_lba_min) {
+        s_stats.read_lba_min = lba;
+    }
+    if (lba > s_stats.read_lba_max) {
+        s_stats.read_lba_max = lba;
+    }
     portEXIT_CRITICAL(&s_stats_mux);
 }
 
-static void stats_record_write(uint32_t bufsize, bool fast)
+static void stats_record_write(uint32_t lba, uint32_t bufsize, bool fast)
 {
     portENTER_CRITICAL(&s_stats_mux);
     s_stats.write_bytes += bufsize;
@@ -146,6 +152,12 @@ static void stats_record_write(uint32_t bufsize, bool fast)
     }
     if (bufsize > s_stats.write_buf_max) {
         s_stats.write_buf_max = bufsize;
+    }
+    if (s_stats.write_lba_min == 0 || lba < s_stats.write_lba_min) {
+        s_stats.write_lba_min = lba;
+    }
+    if (lba > s_stats.write_lba_max) {
+        s_stats.write_lba_max = lba;
     }
     portEXIT_CRITICAL(&s_stats_mux);
 }
@@ -678,7 +690,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
         ret = msc_read_partial(lba, offset, buffer, bufsize);
     }
     unlock_io();
-    stats_record_read(bufsize, fast);
+    stats_record_read(lba, bufsize, fast);
 
     if (ret != ESP_OK)
     {
@@ -727,7 +739,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
         ret = msc_write_partial(lba, offset, buffer, bufsize);
     }
     unlock_io();
-    stats_record_write(bufsize, fast);
+    stats_record_write(lba, bufsize, fast);
 
     if (ret != ESP_OK)
     {
