@@ -747,6 +747,8 @@ esp_err_t sdcard_bench(size_t size_mb, size_t buf_bytes)
     }
 
     size_t written_total = 0;
+    size_t yield_bytes = 0;
+    int64_t last_yield = esp_timer_get_time();
     int fd = fileno(f);
     int64_t write_start = esp_timer_get_time();
     while (written_total < total_bytes) {
@@ -759,7 +761,12 @@ esp_err_t sdcard_bench(size_t size_mb, size_t buf_bytes)
             return ESP_FAIL;
         }
         written_total += wrote;
-        vTaskDelay(1);
+        yield_bytes += wrote;
+        if (yield_bytes >= (64 * 1024) || (esp_timer_get_time() - last_yield) >= 200000) {
+            vTaskDelay(1);
+            yield_bytes = 0;
+            last_yield = esp_timer_get_time();
+        }
     }
     fflush(f);
     fsync(fd);
@@ -774,6 +781,8 @@ esp_err_t sdcard_bench(size_t size_mb, size_t buf_bytes)
     }
 
     size_t read_total = 0;
+    yield_bytes = 0;
+    last_yield = esp_timer_get_time();
     int64_t read_start = esp_timer_get_time();
     while (read_total < total_bytes) {
         size_t to_read = (total_bytes - read_total) > buf_bytes ? buf_bytes : (total_bytes - read_total);
@@ -785,7 +794,12 @@ esp_err_t sdcard_bench(size_t size_mb, size_t buf_bytes)
             return ESP_FAIL;
         }
         read_total += got;
-        vTaskDelay(1);
+        yield_bytes += got;
+        if (yield_bytes >= (64 * 1024) || (esp_timer_get_time() - last_yield) >= 200000) {
+            vTaskDelay(1);
+            yield_bytes = 0;
+            last_yield = esp_timer_get_time();
+        }
     }
     fclose(f);
     int64_t read_end = esp_timer_get_time();
