@@ -964,7 +964,8 @@ static esp_err_t setup_http_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = port;
     cfg.max_uri_handlers = 16;
-    cfg.stack_size = 8192;
+    cfg.stack_size = 16384;
+    ESP_LOGI(TAG, "HTTPD stack_size=%u", cfg.stack_size);
 
     esp_err_t err = httpd_start(&s_http, &cfg);
     if (err != ESP_OK)
