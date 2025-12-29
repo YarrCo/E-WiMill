@@ -29,6 +29,21 @@ SD-карта не используется одновременно:
 
 Любая попытка совмещать доступ приводит к RAW/зависаниям/повреждению данных. Поэтому переключение только вручную.
 
+## Структура проекта (ключевые файлы)
+
+- `main/app_main.c` - точка входа, инициализация подсистем, старт режимов.
+- `main/msc.c`, `main/msc.h` - USB MSC (TinyUSB callbacks, attach/detach, кэш).
+- `main/sdcard.c`, `main/sdcard.h` - SDMMC init, RAW/VFS режимы, mount/unmount, mutex, sdbench.
+- `main/cli.c`, `main/cli.h` - CLI команды (usb/sd/fs).
+- `main/setup_mode.c`, `main/setup_mode.h` - Setup Mode: AP/STA, HTTP server, Web UI (k_index_html), mDNS.
+- `main/web_fs.c`, `main/web_fs.h` - Web File Manager API, upload/download pipeline.
+- `main/button_longpress.c`, `main/button_longpress.h` - long-press обработка кнопки.
+- `main/config_store.c`, `main/config_store.h` - NVS конфиг (dev_name/ssid/psk/port).
+- `main/led_status.c`, `main/led_status.h` - RGB индикация режимов.
+- `main/wimill_pins.h` - пины устройства (SD/LED/BTN).
+- `main/tusb_config.h` - настройки TinyUSB.
+- `components/mdns/` - встроенный mdns компонент для IDF 5.5.x.
+
 ## Этап 1 (MVP-02): USB MSC + CLI/VFS
 
 ### Что происходит при старте
