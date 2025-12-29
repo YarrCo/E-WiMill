@@ -785,7 +785,17 @@ static const char k_index_html[] =
     "if(n) await apiCall('/api/fs/rename',{path:(currentPath==='/'?'/':currentPath+'/')+selected.name,new_name:n});}"
     "async function fsDelete(){if(!selected||!confirm('DELETE '+selected.name+'?'))return;"
     "await apiCall('/api/fs/delete',{path:(currentPath==='/'?'/':currentPath+'/')+selected.name});}"
-    "function fsDownload(){if(selected&&selected.type==='file') window.location='/api/fs/download?path='+encodeURIComponent((currentPath==='/'?'/':currentPath+'/')+selected.name);}"
+    "async function fsDownload(){"
+    "if(!selected||selected.type!=='file')return;"
+    "const path=(currentPath==='/'?'/':currentPath+'/')+selected.name;"
+    "try{const r=await fetch('/api/fs/download?path='+encodeURIComponent(path));"
+    "if(!r.ok){let msg='Download failed';try{const j=await r.json();if(j.error)msg=j.error;}catch(e){}"
+    "alert(msg);return;}"
+    "const blob=await r.blob();const a=document.createElement('a');"
+    "a.href=URL.createObjectURL(blob);a.download=selected.name;"
+    "document.body.appendChild(a);a.click();"
+    "setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1000);"
+    "}catch(e){alert('Download failed');}}"
     "async function apiCall(u,d){await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});refreshFiles();}"
     "</script></body></html>";
 
