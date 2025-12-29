@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -1262,57 +1263,104 @@ static esp_err_t http_fs_download(httpd_req_t *req)
     if (!fs_gate(req)) {
         return ESP_OK;
     }
+    if (!fileop_try_lock(req)) {
+        return ESP_OK;
+    }
 
     char rel_path[MAX_PATH_LEN];
     if (!get_query_path(req, rel_path, sizeof(rel_path))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
-        return ESP_OK;
+        goto cleanup;
     }
     if (strcmp(rel_path, "/") == 0) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
-        return ESP_OK;
+        goto cleanup;
     }
 
     char full_path[MAX_PATH_LEN];
     if (!build_fs_path(rel_path, full_path, sizeof(full_path))) {
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"PATH_FAIL\"}");
-        return ESP_OK;
+        goto cleanup;
     }
 
     struct stat st;
     if (stat(full_path, &st) != 0) {
         send_json_error(req, "404 Not Found", "{\"error\":\"NOT_FOUND\"}");
-        return ESP_OK;
+        goto cleanup;
     }
     if (S_ISDIR(st.st_mode)) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"IS_DIRECTORY\"}");
-        return ESP_OK;
+        goto cleanup;
     }
 
     const char *filename = strrchr(rel_path, '/');
     filename = filename ? filename + 1 : rel_path;
 
-    char disp[128];
-    make_content_disposition(disp, sizeof(disp), filename);
+    ESP_LOGI(TAG, "download start: %s size=%lld", rel_path, (long long)st.st_size);
+
+    char *size_hdr = heap_caps_malloc(32, MALLOC_CAP_8BIT);
+    char *disp = heap_caps_malloc(128, MALLOC_CAP_8BIT);
+    if (!size_hdr || !disp) {
+        if (size_hdr) {
+            heap_caps_free(size_hdr);
+        }
+        if (disp) {
+            heap_caps_free(disp);
+        }
+        send_json_error(req, "500 Internal Server Error", "{\"error\":\"NO_MEM\"}");
+        goto cleanup;
+    }
+    snprintf(size_hdr, 32, "%lld", (long long)st.st_size);
+    make_content_disposition(disp, 128, filename);
+
+    httpd_resp_set_hdr(req, "X-Content-Length", size_hdr);
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Content-Disposition", disp);
 
     FILE *fp = fopen(full_path, "rb");
     if (!fp) {
+        heap_caps_free(size_hdr);
+        heap_caps_free(disp);
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"OPEN_FAIL\"}");
-        return ESP_OK;
+        goto cleanup;
     }
 
-    char buf[FILE_BUF_SIZE];
+    char *buf = heap_caps_malloc(FILE_BUF_SIZE, MALLOC_CAP_8BIT);
+    if (!buf) {
+        fclose(fp);
+        heap_caps_free(size_hdr);
+        heap_caps_free(disp);
+        send_json_error(req, "500 Internal Server Error", "{\"error\":\"NO_MEM\"}");
+        goto cleanup;
+    }
+
     size_t n = 0;
+    uint32_t chunk_count = 0;
     while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) {
+        esp_err_t send_err = httpd_resp_send_chunk(req, buf, n);
+        if (send_err != ESP_OK) {
+            ESP_LOGW(TAG, "download send failed: %s", esp_err_to_name(send_err));
             fclose(fp);
-            return ESP_OK;
+            heap_caps_free(buf);
+            heap_caps_free(size_hdr);
+            heap_caps_free(disp);
+            goto cleanup;
+        }
+        chunk_count++;
+        if ((chunk_count & 0x7) == 0) {
+            vTaskDelay(1);
         }
     }
     fclose(fp);
+    heap_caps_free(buf);
+    heap_caps_free(size_hdr);
+    heap_caps_free(disp);
     httpd_resp_send_chunk(req, NULL, 0);
+    fileop_unlock();
+    return ESP_OK;
+
+cleanup:
+    fileop_unlock();
     return ESP_OK;
 }
 
