@@ -19,6 +19,11 @@
 
 #define TAG "MSC"
 #define MSC_SECTOR_SIZE 512
+#define MSC_CACHE_SECTORS 128
+#define MSC_CACHE_SIZE (MSC_SECTOR_SIZE * MSC_CACHE_SECTORS)
+#define MSC_SUBSECTOR_SIZE 64
+#define MSC_SUBSECTOR_COUNT (MSC_SECTOR_SIZE / MSC_SUBSECTOR_SIZE)
+#define MSC_SUBSECTOR_MASK_FULL ((uint8_t)((1u << MSC_SUBSECTOR_COUNT) - 1u))
 #define MSC_DETACH_DELAY_MS 500
 
 // --- USB DESCRIPTORS (MANUAL) ---
@@ -26,7 +31,7 @@
 #define USB_PID 0x4002
 #define EPNUM_MSC_OUT 0x01
 #define EPNUM_MSC_IN 0x81
-#define TUD_MSC_DESC_LEN (9 + 9 + 7 + 7)
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_MSC_DESC_LEN)
 
 // Device Descriptor
 static const tusb_desc_device_t desc_device = {
@@ -48,7 +53,7 @@ static const tusb_desc_device_t desc_device = {
 // Configuration Descriptor
 static const uint8_t desc_configuration[] = {
     // Config number, interface count, string index, total length, attribute, power in mA
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUD_MSC_DESC_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
     // Interface number, string index, EP Out & EP In address, EP size
     TUD_MSC_DESCRIPTOR(0, 0, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
 };
@@ -66,8 +71,9 @@ typedef struct
 {
     bool valid;
     bool dirty;
-    uint32_t lba;
-    uint8_t data[MSC_SECTOR_SIZE] __attribute__((aligned(4)));
+    uint32_t base_lba;
+    uint8_t data[MSC_CACHE_SIZE] __attribute__((aligned(4)));
+    uint8_t mask[MSC_CACHE_SECTORS];
 } sector_cache_t;
 
 static sdmmc_card_t *s_card = NULL;
@@ -76,6 +82,60 @@ static uint32_t s_block_count = 0;
 static bool s_usb_enabled = false;
 static msc_state_t s_state = MSC_STATE_USB_DETACHED;
 static sector_cache_t s_cache = {0};
+static msc_stats_t s_stats = {0};
+static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static esp_err_t flush_cache_locked(void);
+
+static void stats_record_read(uint32_t bufsize, bool fast)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats.read_bytes += bufsize;
+    if (fast) {
+        s_stats.read_fast_calls++;
+    } else {
+        s_stats.read_partial_calls++;
+    }
+    if (s_stats.read_buf_min == 0 || bufsize < s_stats.read_buf_min) {
+        s_stats.read_buf_min = bufsize;
+    }
+    if (bufsize > s_stats.read_buf_max) {
+        s_stats.read_buf_max = bufsize;
+    }
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+static void stats_record_write(uint32_t bufsize, bool fast)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats.write_bytes += bufsize;
+    if (fast) {
+        s_stats.write_fast_calls++;
+    } else {
+        s_stats.write_partial_calls++;
+    }
+    if (s_stats.write_buf_min == 0 || bufsize < s_stats.write_buf_min) {
+        s_stats.write_buf_min = bufsize;
+    }
+    if (bufsize > s_stats.write_buf_max) {
+        s_stats.write_buf_max = bufsize;
+    }
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+static void stats_record_flush(void)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats.cache_flushes++;
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+static void stats_record_miss(void)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats.cache_misses++;
+    portEXIT_CRITICAL(&s_stats_mux);
+}
 
 static inline void lock_io(void)
 {
@@ -106,27 +166,181 @@ static void set_state(msc_state_t st)
     }
 }
 
+static inline bool cache_contains_lba(uint32_t lba)
+{
+    return s_cache.valid &&
+           lba >= s_cache.base_lba &&
+           lba < (s_cache.base_lba + MSC_CACHE_SECTORS);
+}
+
+static inline bool cache_contains_range(uint32_t lba, uint32_t sectors)
+{
+    if (!s_cache.valid) {
+        return false;
+    }
+    uint32_t end = lba + sectors;
+    uint32_t cache_end = s_cache.base_lba + MSC_CACHE_SECTORS;
+    return lba >= s_cache.base_lba && end <= cache_end;
+}
+
+static inline bool cache_overlaps_range(uint32_t lba, uint32_t sectors)
+{
+    if (!s_cache.valid) {
+        return false;
+    }
+    uint32_t end = lba + sectors;
+    uint32_t cache_end = s_cache.base_lba + MSC_CACHE_SECTORS;
+    return !(end <= s_cache.base_lba || lba >= cache_end);
+}
+
+static inline bool cache_range_full(uint32_t lba, uint32_t sectors)
+{
+    if (!cache_contains_range(lba, sectors)) {
+        return false;
+    }
+    uint32_t start = lba - s_cache.base_lba;
+    for (uint32_t i = 0; i < sectors; ++i) {
+        if (s_cache.mask[start + i] != MSC_SUBSECTOR_MASK_FULL) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline uint32_t cache_base_lba(uint32_t lba)
+{
+    return (lba / MSC_CACHE_SECTORS) * MSC_CACHE_SECTORS;
+}
+
+static inline void cache_masks_set_all(uint8_t value)
+{
+    memset(s_cache.mask, value, sizeof(s_cache.mask));
+}
+
+static esp_err_t cache_prepare_for_write(uint32_t lba)
+{
+    uint32_t base = cache_base_lba(lba);
+    if (s_cache.valid && s_cache.base_lba == base) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
+    s_cache.valid = true;
+    s_cache.dirty = false;
+    s_cache.base_lba = base;
+    cache_masks_set_all(0);
+    return ESP_OK;
+}
+
+static esp_err_t cache_load_full(uint32_t lba)
+{
+    uint32_t base = cache_base_lba(lba);
+    if (s_cache.valid && s_cache.base_lba == base && cache_range_full(base, MSC_CACHE_SECTORS)) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
+    esp_err_t ret = sdmmc_read_sectors(s_card, s_cache.data, base, MSC_CACHE_SECTORS);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    s_cache.valid = true;
+    s_cache.dirty = false;
+    s_cache.base_lba = base;
+    cache_masks_set_all(MSC_SUBSECTOR_MASK_FULL);
+    return ESP_OK;
+}
+
+static esp_err_t cache_ensure_sector_full(uint32_t lba)
+{
+    if (!cache_contains_lba(lba)) {
+        return cache_load_full(lba);
+    }
+    uint32_t idx = lba - s_cache.base_lba;
+    if (s_cache.mask[idx] == MSC_SUBSECTOR_MASK_FULL) {
+        return ESP_OK;
+    }
+    uint8_t temp[MSC_SECTOR_SIZE];
+    esp_err_t ret = sdmmc_read_sectors(s_card, temp, lba, 1);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    uint8_t mask = s_cache.mask[idx];
+    uint8_t *src = s_cache.data + idx * MSC_SECTOR_SIZE;
+    for (uint32_t chunk = 0; chunk < MSC_SUBSECTOR_COUNT; ++chunk) {
+        if (mask & (1u << chunk)) {
+            memcpy(temp + chunk * MSC_SUBSECTOR_SIZE,
+                   src + chunk * MSC_SUBSECTOR_SIZE,
+                   MSC_SUBSECTOR_SIZE);
+        }
+    }
+    memcpy(src, temp, MSC_SECTOR_SIZE);
+    s_cache.mask[idx] = MSC_SUBSECTOR_MASK_FULL;
+    return ESP_OK;
+}
+
 static esp_err_t flush_cache_locked(void)
 {
     if (!s_cache.valid || !s_cache.dirty)
         return ESP_OK;
-    esp_err_t ret = sdmmc_write_sectors(s_card, s_cache.data, s_cache.lba, 1);
-    if (ret == ESP_OK)
+    stats_record_flush();
+    bool any_dirty = false;
+    bool all_full = true;
+    for (uint32_t i = 0; i < MSC_CACHE_SECTORS; ++i) {
+        if (s_cache.mask[i] != 0) {
+            any_dirty = true;
+            if (s_cache.mask[i] != MSC_SUBSECTOR_MASK_FULL) {
+                all_full = false;
+            }
+        } else {
+            all_full = false;
+        }
+    }
+    if (!any_dirty) {
         s_cache.dirty = false;
-    return ret;
-}
-
-static esp_err_t load_cache_locked(uint32_t lba)
-{
-    if (s_cache.valid && s_cache.lba == lba)
         return ESP_OK;
-    ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
-    esp_err_t ret = sdmmc_read_sectors(s_card, s_cache.data, lba, 1);
-    if (ret != ESP_OK)
+    }
+
+    if (all_full) {
+        esp_err_t ret = sdmmc_write_sectors(s_card, s_cache.data, s_cache.base_lba, MSC_CACHE_SECTORS);
+        if (ret == ESP_OK) {
+            s_cache.dirty = false;
+        }
         return ret;
-    s_cache.valid = true;
+    }
+
+    for (uint32_t i = 0; i < MSC_CACHE_SECTORS; ++i) {
+        uint8_t mask = s_cache.mask[i];
+        if (mask == 0) {
+            continue;
+        }
+        uint8_t *sector_ptr = s_cache.data + i * MSC_SECTOR_SIZE;
+        if (mask == MSC_SUBSECTOR_MASK_FULL) {
+            esp_err_t ret = sdmmc_write_sectors(s_card, sector_ptr, s_cache.base_lba + i, 1);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            continue;
+        }
+
+        uint8_t temp[MSC_SECTOR_SIZE];
+        esp_err_t ret = sdmmc_read_sectors(s_card, temp, s_cache.base_lba + i, 1);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        for (uint32_t chunk = 0; chunk < MSC_SUBSECTOR_COUNT; ++chunk) {
+            if (mask & (1u << chunk)) {
+                memcpy(temp + chunk * MSC_SUBSECTOR_SIZE,
+                       sector_ptr + chunk * MSC_SUBSECTOR_SIZE,
+                       MSC_SUBSECTOR_SIZE);
+            }
+        }
+        ret = sdmmc_write_sectors(s_card, temp, s_cache.base_lba + i, 1);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        memcpy(sector_ptr, temp, MSC_SECTOR_SIZE);
+        s_cache.mask[i] = MSC_SUBSECTOR_MASK_FULL;
+    }
     s_cache.dirty = false;
-    s_cache.lba = lba;
     return ESP_OK;
 }
 
@@ -136,8 +350,13 @@ static esp_err_t msc_read_partial(uint32_t lba, uint32_t offset, uint8_t *buffer
         return ESP_ERR_INVALID_STATE;
     if ((offset + bufsize) > s_block_size)
         return ESP_ERR_INVALID_ARG;
-    ESP_RETURN_ON_ERROR(load_cache_locked(lba), TAG, "load failed");
-    memcpy(buffer, s_cache.data + offset, bufsize);
+    ESP_RETURN_ON_ERROR(cache_ensure_sector_full(lba), TAG, "load failed");
+    if (!cache_contains_lba(lba)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint32_t sector_index = lba - s_cache.base_lba;
+    uint32_t cache_offset = sector_index * MSC_SECTOR_SIZE + offset;
+    memcpy(buffer, s_cache.data + cache_offset, bufsize);
     return ESP_OK;
 }
 
@@ -147,12 +366,20 @@ static esp_err_t msc_write_partial(uint32_t lba, uint32_t offset, const uint8_t 
         return ESP_ERR_INVALID_STATE;
     if ((offset + bufsize) > s_block_size)
         return ESP_ERR_INVALID_ARG;
-    if (s_cache.valid && s_cache.dirty && s_cache.lba != lba)
-    {
-        ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
+    ESP_RETURN_ON_ERROR(cache_prepare_for_write(lba), TAG, "load failed");
+    if (!cache_contains_lba(lba)) {
+        return ESP_ERR_INVALID_STATE;
     }
-    ESP_RETURN_ON_ERROR(load_cache_locked(lba), TAG, "load failed");
-    memcpy(s_cache.data + offset, buffer, bufsize);
+    uint32_t sector_index = lba - s_cache.base_lba;
+    uint32_t cache_offset = sector_index * MSC_SECTOR_SIZE + offset;
+    memcpy(s_cache.data + cache_offset, buffer, bufsize);
+    uint32_t start = offset / MSC_SUBSECTOR_SIZE;
+    uint32_t end = (offset + bufsize - 1) / MSC_SUBSECTOR_SIZE;
+    uint8_t mask = 0;
+    for (uint32_t chunk = start; chunk <= end && chunk < MSC_SUBSECTOR_COUNT; ++chunk) {
+        mask |= (uint8_t)(1u << chunk);
+    }
+    s_cache.mask[sector_index] |= mask;
     s_cache.dirty = true;
     return ESP_OK;
 }
@@ -240,6 +467,28 @@ esp_err_t msc_init(void)
 
 msc_state_t msc_get_state(void) { return s_state; }
 
+bool msc_is_host_connected(void)
+{
+    return s_usb_enabled && tud_mounted();
+}
+
+void msc_stats_get(msc_stats_t *out_stats)
+{
+    if (!out_stats) {
+        return;
+    }
+    portENTER_CRITICAL(&s_stats_mux);
+    *out_stats = s_stats;
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+void msc_stats_reset(void)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    memset(&s_stats, 0, sizeof(s_stats));
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
 esp_err_t msc_attach(void)
 {
     if (s_state == MSC_STATE_USB_ATTACHED)
@@ -280,7 +529,7 @@ esp_err_t msc_detach(void)
 
 // --- TinyUSB Callbacks ---
 
-uint8_t tud_msc_get_maxlun_cb(void) { return 0; }
+uint8_t tud_msc_get_maxlun_cb(void) { return 1; }
 
 void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4])
 {
@@ -310,20 +559,30 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
         return -1;
     lock_io();
     esp_err_t ret = ESP_OK;
+    bool fast = (offset == 0 && (bufsize % s_block_size) == 0);
 
     // Fast Path (Optimized)
-    if (offset == 0 && (bufsize % s_block_size) == 0)
+    if (fast)
     {
-        if (s_cache.valid && s_cache.dirty)
-            flush_cache_locked();
         uint32_t sectors = bufsize / s_block_size;
-        ret = sdmmc_read_sectors(s_card, buffer, lba, sectors);
+        if (s_cache.dirty && cache_contains_range(lba, sectors) && cache_range_full(lba, sectors)) {
+            uint32_t cache_offset = (lba - s_cache.base_lba) * MSC_SECTOR_SIZE;
+            memcpy(buffer, s_cache.data + cache_offset, bufsize);
+            ret = ESP_OK;
+        } else {
+            stats_record_miss();
+            if (s_cache.dirty && cache_overlaps_range(lba, sectors)) {
+                ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
+            }
+            ret = sdmmc_read_sectors(s_card, buffer, lba, sectors);
+        }
     }
     else
     {
         ret = msc_read_partial(lba, offset, buffer, bufsize);
     }
     unlock_io();
+    stats_record_read(bufsize, fast);
 
     if (ret != ESP_OK)
     {
@@ -340,25 +599,39 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
         return -1;
     lock_io();
     esp_err_t ret = ESP_OK;
+    bool fast = (offset == 0 && (bufsize % s_block_size) == 0);
 
     // Fast Path (Optimized)
-    if (offset == 0 && (bufsize % s_block_size) == 0)
+    if (fast)
     {
-        if (s_cache.valid && s_cache.dirty)
-            flush_cache_locked();
         uint32_t sectors = bufsize / s_block_size;
-        // Инвалидация кэша, если пишем поверх него
-        if (s_cache.valid && s_cache.lba >= lba && s_cache.lba < (lba + sectors))
-        {
-            s_cache.valid = false;
+        if (s_cache.valid && cache_contains_range(lba, sectors)) {
+            uint32_t cache_offset = (lba - s_cache.base_lba) * MSC_SECTOR_SIZE;
+            memcpy(s_cache.data + cache_offset, buffer, bufsize);
+            for (uint32_t i = 0; i < sectors; ++i) {
+                s_cache.mask[(lba - s_cache.base_lba) + i] = MSC_SUBSECTOR_MASK_FULL;
+            }
+            s_cache.dirty = true;
+            ret = ESP_OK;
+        } else {
+            stats_record_miss();
+            if (s_cache.dirty && cache_overlaps_range(lba, sectors)) {
+                ESP_RETURN_ON_ERROR(flush_cache_locked(), TAG, "flush failed");
+            }
+            if (s_cache.valid && cache_overlaps_range(lba, sectors)) {
+                s_cache.valid = false;
+                s_cache.dirty = false;
+                cache_masks_set_all(0);
+            }
+            ret = sdmmc_write_sectors(s_card, buffer, lba, sectors);
         }
-        ret = sdmmc_write_sectors(s_card, buffer, lba, sectors);
     }
     else
     {
         ret = msc_write_partial(lba, offset, buffer, bufsize);
     }
     unlock_io();
+    stats_record_write(bufsize, fast);
 
     if (ret != ESP_OK)
     {

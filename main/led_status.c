@@ -13,6 +13,9 @@
 static led_strip_handle_t s_strip = NULL;
 static led_state_t s_state = LED_STATE_BOOT;
 static TaskHandle_t s_led_task = NULL;
+static bool s_setup_active = false;
+static bool s_setup_entry_pending = false;
+static bool s_wifi_disconnected = false;
 
 static void set_color(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -31,20 +34,93 @@ static void blink_pattern(uint8_t r, uint8_t g, uint8_t b, uint32_t on_ms, uint3
     vTaskDelay(pdMS_TO_TICKS(off_ms));
 }
 
+static void setup_entry_pattern(void)
+{
+    for (int i = 0; i < 3; ++i) {
+        blink_pattern(0, 0, 64, 120, 120);
+    }
+}
+
+static void setup_breathe(void)
+{
+    for (int level = 0; level <= 64; level += 2) {
+        if (!s_setup_active) {
+            return;
+        }
+        set_color((uint8_t)(level / 4), 0, (uint8_t)level);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    for (int level = 64; level >= 0; level -= 2) {
+        if (!s_setup_active) {
+            return;
+        }
+        set_color((uint8_t)(level / 4), 0, (uint8_t)level);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    for (int level = 0; level <= 64; level += 2) {
+        if (!s_setup_active) {
+            return;
+        }
+        set_color(0, (uint8_t)(level / 2), (uint8_t)level);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    for (int level = 64; level >= 0; level -= 2) {
+        if (!s_setup_active) {
+            return;
+        }
+        set_color(0, (uint8_t)(level / 2), (uint8_t)level);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
+static void normal_breathe(uint8_t r, uint8_t g, uint8_t b, uint32_t step_ms)
+{
+    for (int level = 0; level <= 64; level += 2) {
+        if (s_setup_active) {
+            return;
+        }
+        set_color((uint8_t)((r * level) / 64),
+                  (uint8_t)((g * level) / 64),
+                  (uint8_t)((b * level) / 64));
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+    for (int level = 64; level >= 0; level -= 2) {
+        if (s_setup_active) {
+            return;
+        }
+        set_color((uint8_t)((r * level) / 64),
+                  (uint8_t)((g * level) / 64),
+                  (uint8_t)((b * level) / 64));
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+}
+
 static void led_task(void *arg)
 {
     (void)arg;
     for (;;) {
+        if (s_setup_active) {
+            if (s_setup_entry_pending) {
+                setup_entry_pattern();
+                s_setup_entry_pending = false;
+            }
+            setup_breathe();
+            continue;
+        }
+        if (s_wifi_disconnected) {
+            blink_pattern(96, 0, 24, 200, 800);
+            continue;
+        }
         switch (s_state) {
         case LED_STATE_BOOT:
             blink_pattern(0, 64, 0, 50, 500);
             s_state = LED_STATE_USB_ATTACHED;
             break;
         case LED_STATE_USB_ATTACHED:
-            blink_pattern(0, 0, 64, 200, 1800);
+            normal_breathe(6, 87, 33, 40);
             break;
         case LED_STATE_USB_DETACHED:
-            blink_pattern(64, 32, 0, 100, 400);
+            normal_breathe(6, 87, 33, 40);
             break;
         case LED_STATE_ERROR:
             blink_pattern(64, 0, 0, 100, 200);
@@ -52,6 +128,9 @@ static void led_task(void *arg)
             break;
         case LED_STATE_QUEUE_WAIT:
             blink_pattern(48, 0, 48, 150, 500);
+            break;
+        case LED_STATE_WIFI_DISCONNECTED:
+            blink_pattern(96, 0, 24, 200, 800);
             break;
         default:
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -90,4 +169,21 @@ void led_status_init(void)
 void led_status_set(led_state_t state)
 {
     s_state = state;
+}
+
+void led_status_set_setup(bool active)
+{
+    if (active && !s_setup_active) {
+        s_setup_active = true;
+        s_setup_entry_pending = true;
+    } else if (!active && s_setup_active) {
+        s_setup_active = false;
+        s_setup_entry_pending = false;
+        set_color(0, 0, 0);
+    }
+}
+
+void led_status_set_wifi(bool connected)
+{
+    s_wifi_disconnected = !connected;
 }

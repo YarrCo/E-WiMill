@@ -9,13 +9,19 @@
 // Default UART console speed
 #define WIMILL_UART_BAUD 115200
 
+// Setup mode button (active-low)
+#define WIMILL_PIN_SETUP_BTN 21
+
 // Mount point for the FATFS
 #define WIMILL_SD_MOUNT_POINT "/sdcard"
 
 // SD SPI frequency control (kHz)
-#define WIMILL_SD_FREQ_KHZ_DEFAULT 20000
-#define WIMILL_SD_FREQ_KHZ_20MHZ    20000
-#define WIMILL_SD_FREQ_KHZ_26MHZ    26000
+#define WIMILL_SD_FREQ_KHZ_DEFAULT 40000
+#define WIMILL_SD_FREQ_KHZ_MIN     20000
+#define WIMILL_SD_FREQ_KHZ_20MHZ   20000
+#define WIMILL_SD_FREQ_KHZ_26MHZ   26000
+#define WIMILL_SD_FREQ_KHZ_40MHZ   40000
+#define WIMILL_SD_FREQ_KHZ_MAX     40000
 
 // SD self-test buffer size (bytes)
 #define WIMILL_SDTEST_BUF_SZ 16384

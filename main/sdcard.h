@@ -44,6 +44,8 @@ const char *sdcard_mount_point(void);
 uint32_t sdcard_get_current_freq_khz(void);
 uint32_t sdcard_get_default_freq_khz(void);
 esp_err_t sdcard_set_frequency(uint32_t freq_khz, bool remount);
+bool sdcard_get_disk_status_check(void);
+esp_err_t sdcard_set_disk_status_check(bool enable, bool remount);
 
 esp_err_t sdcard_get_status(sdcard_status_t *out_status);
 esp_err_t sdcard_get_space(sd_space_info_t *info);
@@ -53,3 +55,4 @@ esp_err_t sdcard_mkdir(const char *path);
 esp_err_t sdcard_cat(const char *path, size_t max_bytes);
 esp_err_t sdcard_touch(const char *path, size_t size_bytes);
 esp_err_t sdcard_self_test(size_t size_mb, uint32_t freq_khz, size_t buf_bytes);
+esp_err_t sdcard_bench(size_t size_mb, size_t buf_bytes);
