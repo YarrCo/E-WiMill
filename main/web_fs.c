@@ -8,18 +8,27 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 
 #include "msc.h"
 #include "sdcard.h"
 
 #define TAG "WEBFS"
-#define FILE_BUF_SIZE 2048
-#define UPLOAD_HEADER_SIZE 8192
-#define UPLOAD_TAIL_SIZE 96
-#define UPLOAD_WORK_SIZE (FILE_BUF_SIZE + UPLOAD_TAIL_SIZE)
+#define FILE_BUF_SIZE 8192
+#define UPLOAD_RECV_BUF_SIZE (32 * 1024)
+#define UPLOAD_HEADER_SIZE 16384
+#define UPLOAD_TAIL_SIZE 128
+#define UPLOAD_WORK_SIZE (UPLOAD_RECV_BUF_SIZE + UPLOAD_TAIL_SIZE)
+#define UPLOAD_RINGBUF_SIZE_DEFAULT (512 * 1024)
+#define UPLOAD_RINGBUF_SIZE_FALLBACK (256 * 1024)
+#define UPLOAD_LOG_INTERVAL_US 1000000
+#define UPLOAD_WRITER_STACK 8192
+#define UPLOAD_WRITER_PRIO 5
 #define MAX_QUERY_LEN 128
 #define MAX_PATH_LEN 256
 #define MAX_NAME_LEN 96
@@ -27,9 +36,224 @@
 
 static SemaphoreHandle_t s_fileop_mutex = NULL;
 static char s_upload_header[UPLOAD_HEADER_SIZE];
-static char s_upload_buf[FILE_BUF_SIZE];
-static char s_upload_work[UPLOAD_WORK_SIZE];
+static uint8_t s_upload_recv_fallback[UPLOAD_RECV_BUF_SIZE];
+static uint8_t s_upload_work_fallback[UPLOAD_WORK_SIZE];
 static char s_upload_tail[UPLOAD_TAIL_SIZE];
+static char s_upload_file_buf[32 * 1024];
+
+typedef struct {
+    RingbufHandle_t rb;
+    SemaphoreHandle_t done_sem;
+    FILE *fp;
+    volatile bool input_done;
+    esp_err_t result;
+    portMUX_TYPE mux;
+    uint64_t bytes_received;
+    uint64_t bytes_written;
+    uint64_t recv_time_us;
+    uint64_t write_time_us;
+    uint32_t max_write_chunk;
+    uint32_t max_recv_chunk;
+    int64_t start_us;
+    int64_t last_log_us;
+} upload_ctx_t;
+
+static uint8_t *upload_alloc_buf(size_t size, uint8_t *fallback, bool *used_fallback)
+{
+    uint8_t *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = fallback;
+        if (used_fallback) {
+            *used_fallback = true;
+        }
+        return buf;
+    }
+    if (used_fallback) {
+        *used_fallback = false;
+    }
+    return buf;
+}
+
+static void upload_free_buf(uint8_t *buf, bool used_fallback)
+{
+    if (buf && !used_fallback) {
+        heap_caps_free(buf);
+    }
+}
+
+static RingbufHandle_t upload_ringbuf_create(size_t *out_size)
+{
+    RingbufHandle_t rb = xRingbufferCreateWithCaps(UPLOAD_RINGBUF_SIZE_DEFAULT,
+                                                   RINGBUF_TYPE_BYTEBUF,
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rb) {
+        if (out_size) {
+            *out_size = UPLOAD_RINGBUF_SIZE_DEFAULT;
+        }
+        return rb;
+    }
+    rb = xRingbufferCreateWithCaps(UPLOAD_RINGBUF_SIZE_FALLBACK,
+                                   RINGBUF_TYPE_BYTEBUF,
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rb) {
+        if (out_size) {
+            *out_size = UPLOAD_RINGBUF_SIZE_FALLBACK;
+        }
+        return rb;
+    }
+    rb = xRingbufferCreate(UPLOAD_RINGBUF_SIZE_FALLBACK, RINGBUF_TYPE_BYTEBUF);
+    if (out_size) {
+        *out_size = rb ? UPLOAD_RINGBUF_SIZE_FALLBACK : 0;
+    }
+    return rb;
+}
+
+static void upload_stats_add_recv(upload_ctx_t *ctx, uint32_t bytes, uint64_t dur_us)
+{
+    portENTER_CRITICAL(&ctx->mux);
+    ctx->bytes_received += bytes;
+    ctx->recv_time_us += dur_us;
+    if (bytes > ctx->max_recv_chunk) {
+        ctx->max_recv_chunk = bytes;
+    }
+    portEXIT_CRITICAL(&ctx->mux);
+}
+
+static void upload_stats_add_write(upload_ctx_t *ctx, uint32_t bytes, uint64_t dur_us)
+{
+    portENTER_CRITICAL(&ctx->mux);
+    ctx->bytes_written += bytes;
+    ctx->write_time_us += dur_us;
+    if (bytes > ctx->max_write_chunk) {
+        ctx->max_write_chunk = bytes;
+    }
+    portEXIT_CRITICAL(&ctx->mux);
+}
+
+static void upload_stats_log(upload_ctx_t *ctx, int64_t now_us, bool final)
+{
+    uint64_t recv_bytes;
+    uint64_t write_bytes;
+    uint64_t recv_us;
+    uint64_t write_us;
+    uint32_t max_write;
+    int64_t start_us;
+    int64_t last_log;
+
+    portENTER_CRITICAL(&ctx->mux);
+    recv_bytes = ctx->bytes_received;
+    write_bytes = ctx->bytes_written;
+    recv_us = ctx->recv_time_us;
+    write_us = ctx->write_time_us;
+    max_write = ctx->max_write_chunk;
+    start_us = ctx->start_us;
+    last_log = ctx->last_log_us;
+    if (final || (now_us - last_log) >= UPLOAD_LOG_INTERVAL_US) {
+        ctx->last_log_us = now_us;
+    } else {
+        portEXIT_CRITICAL(&ctx->mux);
+        return;
+    }
+    portEXIT_CRITICAL(&ctx->mux);
+
+    double elapsed_s = (double)(now_us - start_us) / 1e6;
+    double avg_kbps = elapsed_s > 0.0 ? (double)write_bytes / 1024.0 / elapsed_s : 0.0;
+    double recv_ms = (double)recv_us / 1000.0;
+    double write_ms = (double)write_us / 1000.0;
+
+    ESP_LOGI(TAG, "UPLOAD%s recv=%llu write=%llu avg=%.1f KB/s max_write=%u recv_ms=%.1f write_ms=%.1f",
+             final ? "_DONE" : "",
+             (unsigned long long)recv_bytes,
+             (unsigned long long)write_bytes,
+             avg_kbps,
+             max_write,
+             recv_ms,
+             write_ms);
+}
+
+static void upload_writer_task(void *arg)
+{
+    upload_ctx_t *ctx = (upload_ctx_t *)arg;
+    while (true) {
+        size_t item_size = 0;
+        uint8_t *item = (uint8_t *)xRingbufferReceive(ctx->rb, &item_size, pdMS_TO_TICKS(200));
+        if (!item) {
+            if (ctx->input_done) {
+                break;
+            }
+            continue;
+        }
+        int64_t t0 = esp_timer_get_time();
+        size_t written = fwrite(item, 1, item_size, ctx->fp);
+        int64_t t1 = esp_timer_get_time();
+        vRingbufferReturnItem(ctx->rb, item);
+        if (written != item_size) {
+            ctx->result = ESP_FAIL;
+            break;
+        }
+        upload_stats_add_write(ctx, (uint32_t)written, (uint64_t)(t1 - t0));
+    }
+    if (ctx->result == ESP_OK) {
+        fflush(ctx->fp);
+        fsync(fileno(ctx->fp));
+    }
+    fclose(ctx->fp);
+    ctx->fp = NULL;
+    xSemaphoreGive(ctx->done_sem);
+    vTaskDelete(NULL);
+}
+
+static bool upload_ringbuf_send(upload_ctx_t *ctx, const uint8_t *data, size_t len)
+{
+    if (len == 0) {
+        return true;
+    }
+    if (xRingbufferSend(ctx->rb, data, len, portMAX_DELAY) != pdTRUE) {
+        ctx->result = ESP_FAIL;
+        return false;
+    }
+    return true;
+}
+
+static bool upload_ctx_start(upload_ctx_t *ctx, FILE *fp, size_t *rb_size_out)
+{
+    ctx->fp = fp;
+    ctx->result = ESP_OK;
+    ctx->done_sem = xSemaphoreCreateBinary();
+    if (!ctx->done_sem) {
+        return false;
+    }
+    ctx->rb = upload_ringbuf_create(rb_size_out);
+    if (!ctx->rb) {
+        vSemaphoreDelete(ctx->done_sem);
+        ctx->done_sem = NULL;
+        return false;
+    }
+    if (xTaskCreate(upload_writer_task, "upload_writer", UPLOAD_WRITER_STACK, ctx,
+                    UPLOAD_WRITER_PRIO, NULL) != pdPASS) {
+        vRingbufferDelete(ctx->rb);
+        vSemaphoreDelete(ctx->done_sem);
+        ctx->rb = NULL;
+        ctx->done_sem = NULL;
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t upload_ctx_finish(upload_ctx_t *ctx)
+{
+    ctx->input_done = true;
+    if (ctx->done_sem) {
+        xSemaphoreTake(ctx->done_sem, portMAX_DELAY);
+        vSemaphoreDelete(ctx->done_sem);
+        ctx->done_sem = NULL;
+    }
+    if (ctx->rb) {
+        vRingbufferDelete(ctx->rb);
+        ctx->rb = NULL;
+    }
+    return ctx->result;
+}
 
 static void send_json_error(httpd_req_t *req, const char *status, const char *json)
 {
@@ -381,6 +605,26 @@ static bool get_query_flag(httpd_req_t *req, const char *key)
     return (strcmp(val, "1") == 0 || strcmp(val, "true") == 0 || strcmp(val, "yes") == 0 || strcmp(val, "on") == 0);
 }
 
+static bool get_query_value(httpd_req_t *req, const char *key, char *out, size_t out_len)
+{
+    char query[MAX_QUERY_LEN] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return false;
+    }
+    char raw[MAX_NAME_LEN] = {0};
+    if (httpd_query_key_value(query, key, raw, sizeof(raw)) != ESP_OK) {
+        return false;
+    }
+    char decoded[MAX_NAME_LEN];
+    url_decode(decoded, sizeof(decoded), raw);
+    if (decoded[0] == '\0') {
+        return false;
+    }
+    strncpy(out, decoded, out_len);
+    out[out_len - 1] = '\0';
+    return true;
+}
+
 static bool read_body(httpd_req_t *req, char *buf, size_t buf_len)
 {
     int total = req->content_len;
@@ -570,6 +814,23 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
     }
 
     esp_err_t result = ESP_OK;
+    upload_ctx_t ctx = {0};
+    ctx.mux = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+    ctx.start_us = esp_timer_get_time();
+    ctx.last_log_us = ctx.start_us;
+    FILE *fp = NULL;
+    bool ctx_started = false;
+    bool upload_ok = false;
+
+    bool recv_fallback = false;
+    bool work_fallback = false;
+    uint8_t *recv_buf = upload_alloc_buf(UPLOAD_RECV_BUF_SIZE, s_upload_recv_fallback, &recv_fallback);
+    uint8_t *work_buf = upload_alloc_buf(UPLOAD_WORK_SIZE, s_upload_work_fallback, &work_fallback);
+    if (!recv_buf || !work_buf) {
+        send_json_error(req, "500 Internal Server Error", "{\"error\":\"NO_MEM\"}");
+        goto cleanup;
+    }
+
     char rel_dir[MAX_PATH_LEN];
     if (!get_query_path(req, rel_dir, sizeof(rel_dir))) {
         send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
@@ -609,12 +870,21 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
     int header_len = 0;
     bool header_done = false;
     char filename[MAX_NAME_LEN] = {0};
+    char full_path[MAX_PATH_LEN] = {0};
+    char tmp_path[MAX_PATH_LEN] = {0};
 
-    char *buf = s_upload_buf;
+    char boundary_marker[80];
+    size_t marker_len = 0;
+    char *tail = s_upload_tail;
+    size_t tail_len = 0;
+
     int remaining = req->content_len;
     int r = 0;
     while (!header_done && remaining > 0) {
-        r = httpd_req_recv(req, buf, remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining);
+        int to_read = remaining > (int)UPLOAD_RECV_BUF_SIZE ? (int)UPLOAD_RECV_BUF_SIZE : remaining;
+        int64_t t0 = esp_timer_get_time();
+        r = httpd_req_recv(req, (char *)recv_buf, to_read);
+        int64_t t1 = esp_timer_get_time();
         if (r == HTTPD_SOCK_ERR_TIMEOUT) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
@@ -624,6 +894,9 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
             goto cleanup;
         }
         remaining -= r;
+        upload_stats_add_recv(&ctx, (uint32_t)r, (uint64_t)(t1 - t0));
+        upload_stats_log(&ctx, t1, false);
+
         if (header_len < (int)UPLOAD_HEADER_SIZE - 1) {
             int to_copy = r;
             int space = (int)UPLOAD_HEADER_SIZE - 1 - header_len;
@@ -631,7 +904,7 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
                 to_copy = space;
             }
             if (to_copy > 0) {
-                memcpy(header_buf + header_len, buf, to_copy);
+                memcpy(header_buf + header_len, recv_buf, to_copy);
                 header_len += to_copy;
                 header_buf[header_len] = '\0';
             }
@@ -657,7 +930,6 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
                 send_json_error(req, "400 Bad Request", "{\"error\":\"PATH_TOO_LONG\"}");
                 goto cleanup;
             }
-            char full_path[MAX_PATH_LEN];
             if (!build_fs_path(rel_file, full_path, sizeof(full_path))) {
                 send_json_error(req, "500 Internal Server Error", "{\"error\":\"PATH_FAIL\"}");
                 goto cleanup;
@@ -678,95 +950,105 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
                 }
             }
 
-            char tmp_path[MAX_PATH_LEN];
             if (!build_suffix_path(full_path, ".part", tmp_path, sizeof(tmp_path))) {
                 send_json_error(req, "400 Bad Request", "{\"error\":\"PATH_TOO_LONG\"}");
                 goto cleanup;
             }
             unlink(tmp_path);
 
-            FILE *fp = fopen(tmp_path, "wb");
+            fp = fopen(tmp_path, "wb");
             if (!fp) {
                 send_json_error(req, "500 Internal Server Error", "{\"error\":\"OPEN_FAIL\"}");
                 goto cleanup;
             }
+            setvbuf(fp, s_upload_file_buf, _IOFBF, sizeof(s_upload_file_buf));
 
-            char boundary_marker[80];
+            if (!upload_ctx_start(&ctx, fp, NULL)) {
+                send_json_error(req, "500 Internal Server Error", "{\"error\":\"NO_MEM\"}");
+                goto cleanup;
+            }
+            ctx_started = true;
+
             snprintf(boundary_marker, sizeof(boundary_marker), "\r\n--%s", boundary);
-            size_t marker_len = strlen(boundary_marker);
+            marker_len = strlen(boundary_marker);
             if (marker_len + 1 > sizeof(s_upload_tail)) {
-                fclose(fp);
-                unlink(tmp_path);
                 send_json_error(req, "400 Bad Request", "{\"error\":\"BOUNDARY_TOO_LONG\"}");
                 goto cleanup;
             }
-            char *tail = s_upload_tail;
-            size_t tail_len = 0;
 
             char *data_start = header_end + (header_mark ? header_mark : 4);
             int data_len = header_len - (int)(data_start - header_buf);
             if (data_len > 0) {
-                memcpy(buf, data_start, (size_t)data_len);
-                r = data_len;
-            } else {
-                r = 0;
+                if (!upload_ringbuf_send(&ctx, (const uint8_t *)data_start, (size_t)data_len)) {
+                    send_json_error(req, "500 Internal Server Error", "{\"error\":\"WRITE_FAIL\"}");
+                    goto cleanup;
+                }
             }
 
             bool done = false;
+            r = 0;
             while (!done) {
                 if (r == 0 && remaining > 0) {
-                    r = httpd_req_recv(req, buf, remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining);
+                    int to_read2 = remaining > (int)UPLOAD_RECV_BUF_SIZE ? (int)UPLOAD_RECV_BUF_SIZE : remaining;
+                    int64_t rt0 = esp_timer_get_time();
+                    r = httpd_req_recv(req, (char *)recv_buf, to_read2);
+                    int64_t rt1 = esp_timer_get_time();
                     if (r == HTTPD_SOCK_ERR_TIMEOUT) {
                         vTaskDelay(pdMS_TO_TICKS(10));
                         r = 0;
                         continue;
                     }
                     if (r <= 0) {
-                        fclose(fp);
-                        unlink(tmp_path);
                         send_json_error(req, "400 Bad Request", "{\"error\":\"RECV_FAIL\"}");
                         goto cleanup;
                     }
                     remaining -= r;
+                    upload_stats_add_recv(&ctx, (uint32_t)r, (uint64_t)(rt1 - rt0));
+                    upload_stats_log(&ctx, rt1, false);
                 }
                 if (r == 0 && remaining == 0) {
                     break;
                 }
 
-                char *work = s_upload_work;
                 size_t work_len = 0;
                 if (tail_len > 0) {
-                    memcpy(work, tail, tail_len);
+                    memcpy(work_buf, tail, tail_len);
                     work_len += tail_len;
                 }
                 if (r > 0) {
-                    memcpy(work + work_len, buf, (size_t)r);
+                    memcpy(work_buf + work_len, recv_buf, (size_t)r);
                     work_len += (size_t)r;
                 }
 
                 char *pos = NULL;
                 if (work_len >= marker_len) {
-                    pos = find_seq(work, work_len, boundary_marker, marker_len);
+                    pos = find_seq((const char *)work_buf, work_len, boundary_marker, marker_len);
                 }
                 if (pos) {
-                    size_t data_bytes = (size_t)(pos - work);
+                    size_t data_bytes = (size_t)((uint8_t *)pos - work_buf);
                     if (data_bytes > 0) {
-                        fwrite(work, 1, data_bytes, fp);
+                        if (!upload_ringbuf_send(&ctx, work_buf, data_bytes)) {
+                            send_json_error(req, "500 Internal Server Error", "{\"error\":\"WRITE_FAIL\"}");
+                            goto cleanup;
+                        }
                     }
                     done = true;
                 } else {
                     size_t keep = marker_len > 1 ? marker_len - 1 : 0;
                     if (work_len > keep) {
                         size_t write_len = work_len - keep;
-                        fwrite(work, 1, write_len, fp);
+                        if (!upload_ringbuf_send(&ctx, work_buf, write_len)) {
+                            send_json_error(req, "500 Internal Server Error", "{\"error\":\"WRITE_FAIL\"}");
+                            goto cleanup;
+                        }
                         if (keep > 0) {
-                            memcpy(tail, work + write_len, keep);
+                            memcpy(tail, work_buf + write_len, keep);
                             tail_len = keep;
                         } else {
                             tail_len = 0;
                         }
                     } else {
-                        memcpy(tail, work, work_len);
+                        memcpy(tail, work_buf, work_len);
                         tail_len = work_len;
                     }
                 }
@@ -774,7 +1056,10 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
             }
 
             while (remaining > 0) {
-                int d = httpd_req_recv(req, buf, remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining);
+                int to_read3 = remaining > (int)UPLOAD_RECV_BUF_SIZE ? (int)UPLOAD_RECV_BUF_SIZE : remaining;
+                int64_t rt0 = esp_timer_get_time();
+                int d = httpd_req_recv(req, (char *)recv_buf, to_read3);
+                int64_t rt1 = esp_timer_get_time();
                 if (d == HTTPD_SOCK_ERR_TIMEOUT) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                     continue;
@@ -783,20 +1068,25 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
                     break;
                 }
                 remaining -= d;
+                upload_stats_add_recv(&ctx, (uint32_t)d, (uint64_t)(rt1 - rt0));
+                upload_stats_log(&ctx, rt1, false);
             }
 
-            fflush(fp);
-            fsync(fileno(fp));
-            fclose(fp);
+            result = upload_ctx_finish(&ctx);
+            upload_stats_log(&ctx, esp_timer_get_time(), true);
+            if (result != ESP_OK) {
+                send_json_error(req, "500 Internal Server Error", "{\"error\":\"WRITE_FAIL\"}");
+                goto cleanup;
+            }
 
             if (rename(tmp_path, full_path) != 0) {
-                unlink(tmp_path);
                 send_json_error(req, "500 Internal Server Error", "{\"error\":\"RENAME_FAIL\"}");
                 goto cleanup;
             }
 
             httpd_resp_set_type(req, "application/json");
             httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+            upload_ok = true;
             goto cleanup;
         }
         if (!header_done && header_len >= (int)UPLOAD_HEADER_SIZE - 1) {
@@ -808,6 +1098,161 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
     send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_MULTIPART\"}");
 
 cleanup:
+    if (ctx_started && !upload_ok) {
+        upload_ctx_finish(&ctx);
+    } else if (!ctx_started && fp) {
+        fclose(fp);
+    }
+    if (!upload_ok && tmp_path[0]) {
+        unlink(tmp_path);
+    }
+    upload_free_buf(recv_buf, recv_fallback);
+    upload_free_buf(work_buf, work_fallback);
+    fileop_unlock();
+    return result;
+}
+
+static esp_err_t http_fs_upload_raw(httpd_req_t *req)
+{
+    if (!fs_gate(req)) {
+        drain_body(req);
+        return ESP_OK;
+    }
+    if (!fileop_try_lock(req)) {
+        drain_body(req);
+        return ESP_OK;
+    }
+
+    esp_err_t result = ESP_OK;
+    upload_ctx_t ctx = {0};
+    ctx.mux = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+    ctx.start_us = esp_timer_get_time();
+    ctx.last_log_us = ctx.start_us;
+    FILE *fp = NULL;
+    bool ctx_started = false;
+    bool upload_ok = false;
+
+    bool recv_fallback = false;
+    uint8_t *recv_buf = upload_alloc_buf(UPLOAD_RECV_BUF_SIZE, s_upload_recv_fallback, &recv_fallback);
+    if (!recv_buf) {
+        send_json_error(req, "500 Internal Server Error", "{\"error\":\"NO_MEM\"}");
+        goto cleanup;
+    }
+
+    char rel_dir[MAX_PATH_LEN];
+    if (!get_query_path(req, rel_dir, sizeof(rel_dir))) {
+        send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_PATH\"}");
+        goto cleanup;
+    }
+    char name_raw[MAX_NAME_LEN];
+    if (!get_query_value(req, "name", name_raw, sizeof(name_raw))) {
+        send_json_error(req, "400 Bad Request", "{\"error\":\"NO_NAME\"}");
+        goto cleanup;
+    }
+    char clean_name[MAX_NAME_LEN];
+    if (!sanitize_name(name_raw, clean_name, sizeof(clean_name))) {
+        send_json_error(req, "400 Bad Request", "{\"error\":\"BAD_NAME\"}");
+        goto cleanup;
+    }
+    bool overwrite = get_query_flag(req, "overwrite");
+
+    char rel_file[MAX_PATH_LEN];
+    if (!build_rel_child(rel_dir, clean_name, rel_file, sizeof(rel_file))) {
+        send_json_error(req, "400 Bad Request", "{\"error\":\"PATH_TOO_LONG\"}");
+        goto cleanup;
+    }
+    char full_path[MAX_PATH_LEN];
+    if (!build_fs_path(rel_file, full_path, sizeof(full_path))) {
+        send_json_error(req, "500 Internal Server Error", "{\"error\":\"PATH_FAIL\"}");
+        goto cleanup;
+    }
+    struct stat st;
+    if (stat(full_path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            send_json_error(req, "409 Conflict", "{\"error\":\"IS_DIRECTORY\"}");
+            goto cleanup;
+        }
+        if (!overwrite) {
+            send_json_error(req, "409 Conflict", "{\"error\":\"FILE_EXISTS\"}");
+            goto cleanup;
+        }
+        if (unlink(full_path) != 0) {
+            send_json_error(req, "500 Internal Server Error", "{\"error\":\"DELETE_FAIL\"}");
+            goto cleanup;
+        }
+    }
+
+    char tmp_path[MAX_PATH_LEN] = {0};
+    if (!build_suffix_path(full_path, ".part", tmp_path, sizeof(tmp_path))) {
+        send_json_error(req, "400 Bad Request", "{\"error\":\"PATH_TOO_LONG\"}");
+        goto cleanup;
+    }
+    unlink(tmp_path);
+
+    int remaining = req->content_len;
+    if (remaining <= 0) {
+        send_json_error(req, "400 Bad Request", "{\"error\":\"NO_BODY\"}");
+        goto cleanup;
+    }
+
+    fp = fopen(tmp_path, "wb");
+    if (!fp) {
+        send_json_error(req, "500 Internal Server Error", "{\"error\":\"OPEN_FAIL\"}");
+        goto cleanup;
+    }
+    setvbuf(fp, s_upload_file_buf, _IOFBF, sizeof(s_upload_file_buf));
+    if (!upload_ctx_start(&ctx, fp, NULL)) {
+        send_json_error(req, "500 Internal Server Error", "{\"error\":\"NO_MEM\"}");
+        goto cleanup;
+    }
+    ctx_started = true;
+
+    while (remaining > 0) {
+        int to_read = remaining > (int)UPLOAD_RECV_BUF_SIZE ? (int)UPLOAD_RECV_BUF_SIZE : remaining;
+        int64_t t0 = esp_timer_get_time();
+        int r = httpd_req_recv(req, (char *)recv_buf, to_read);
+        int64_t t1 = esp_timer_get_time();
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (r <= 0) {
+            send_json_error(req, "400 Bad Request", "{\"error\":\"RECV_FAIL\"}");
+            goto cleanup;
+        }
+        remaining -= r;
+        upload_stats_add_recv(&ctx, (uint32_t)r, (uint64_t)(t1 - t0));
+        upload_stats_log(&ctx, t1, false);
+        if (!upload_ringbuf_send(&ctx, recv_buf, (size_t)r)) {
+            send_json_error(req, "500 Internal Server Error", "{\"error\":\"WRITE_FAIL\"}");
+            goto cleanup;
+        }
+    }
+
+    result = upload_ctx_finish(&ctx);
+    upload_stats_log(&ctx, esp_timer_get_time(), true);
+    if (result != ESP_OK) {
+        send_json_error(req, "500 Internal Server Error", "{\"error\":\"WRITE_FAIL\"}");
+        goto cleanup;
+    }
+    if (rename(tmp_path, full_path) != 0) {
+        send_json_error(req, "500 Internal Server Error", "{\"error\":\"RENAME_FAIL\"}");
+        goto cleanup;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    upload_ok = true;
+
+cleanup:
+    if (ctx_started && !upload_ok) {
+        upload_ctx_finish(&ctx);
+    } else if (!ctx_started && fp) {
+        fclose(fp);
+    }
+    if (!upload_ok && tmp_path[0]) {
+        unlink(tmp_path);
+    }
+    upload_free_buf(recv_buf, recv_fallback);
     fileop_unlock();
     return result;
 }
@@ -1147,6 +1592,12 @@ esp_err_t web_fs_register_handlers(httpd_handle_t server)
         .handler = http_fs_upload,
         .user_ctx = NULL,
     };
+    httpd_uri_t upload_raw = {
+        .uri = "/api/fs/upload_raw",
+        .method = HTTP_POST,
+        .handler = http_fs_upload_raw,
+        .user_ctx = NULL,
+    };
     httpd_uri_t download = {
         .uri = "/api/fs/download",
         .method = HTTP_GET,
@@ -1186,6 +1637,7 @@ esp_err_t web_fs_register_handlers(httpd_handle_t server)
 
     httpd_register_uri_handler(server, &list);
     httpd_register_uri_handler(server, &upload);
+    httpd_register_uri_handler(server, &upload_raw);
     httpd_register_uri_handler(server, &download);
     httpd_register_uri_handler(server, &mkdir_req);
     httpd_register_uri_handler(server, &del_req);
