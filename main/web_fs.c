@@ -3,10 +3,12 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utime.h>
 
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -712,6 +714,51 @@ static bool get_query_value(httpd_req_t *req, const char *key, char *out, size_t
     return true;
 }
 
+static bool get_query_u64(httpd_req_t *req, const char *key, uint64_t *out)
+{
+    char query[MAX_QUERY_LEN] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK)
+    {
+        return false;
+    }
+    char raw[32] = {0};
+    if (httpd_query_key_value(query, key, raw, sizeof(raw)) != ESP_OK)
+    {
+        return false;
+    }
+    char decoded[32];
+    url_decode(decoded, sizeof(decoded), raw);
+    if (decoded[0] == '\0')
+    {
+        return false;
+    }
+    char *end = NULL;
+    unsigned long long val = strtoull(decoded, &end, 10);
+    if (end == decoded || (end && *end != '\0'))
+    {
+        return false;
+    }
+    *out = (uint64_t)val;
+    return true;
+}
+
+static void apply_mtime_if_needed(const char *path, uint64_t mtime_ms)
+{
+    if (!path || mtime_ms == 0)
+    {
+        return;
+    }
+    time_t t = (time_t)(mtime_ms / 1000ULL);
+    struct utimbuf tb = {
+        .actime = t,
+        .modtime = t,
+    };
+    if (utime(path, &tb) != 0)
+    {
+        ESP_LOGW(TAG, "utime failed for %s", path);
+    }
+}
+
 static bool read_body(httpd_req_t *req, char *buf, size_t buf_len)
 {
     int total = req->content_len;
@@ -881,15 +928,16 @@ static esp_err_t http_fs_list(httpd_req_t *req)
         json_escape(safe_name, sizeof(safe_name), ent->d_name);
         if (S_ISDIR(st.st_mode))
         {
-            char line[160];
-            snprintf(line, sizeof(line), "{\"name\":\"%s\",\"type\":\"dir\"}", safe_name);
+            char line[200];
+            snprintf(line, sizeof(line), "{\"name\":\"%s\",\"type\":\"dir\",\"mtime\":%lld}",
+                     safe_name, (long long)st.st_mtime);
             httpd_resp_sendstr_chunk(req, line);
         }
         else
         {
-            char line[200];
-            snprintf(line, sizeof(line), "{\"name\":\"%s\",\"type\":\"file\",\"size\":%ld}",
-                     safe_name, (long)st.st_size);
+            char line[220];
+            snprintf(line, sizeof(line), "{\"name\":\"%s\",\"type\":\"file\",\"size\":%ld,\"mtime\":%lld}",
+                     safe_name, (long)st.st_size, (long long)st.st_mtime);
             httpd_resp_sendstr_chunk(req, line);
         }
     }
@@ -961,6 +1009,8 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
         goto cleanup;
     }
     bool overwrite = get_query_flag(req, "overwrite");
+    uint64_t mtime_ms = 0;
+    get_query_u64(req, "mtime", &mtime_ms);
 
     char content_type[128];
     if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK)
@@ -1258,6 +1308,7 @@ static esp_err_t http_fs_upload(httpd_req_t *req)
                 send_json_error(req, "500 Internal Server Error", "{\"error\":\"RENAME_FAIL\"}");
                 goto cleanup;
             }
+            apply_mtime_if_needed(full_path, mtime_ms);
 
             httpd_resp_set_type(req, "application/json");
             httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -1341,6 +1392,8 @@ static esp_err_t http_fs_upload_raw(httpd_req_t *req)
         goto cleanup;
     }
     bool overwrite = get_query_flag(req, "overwrite");
+    uint64_t mtime_ms = 0;
+    get_query_u64(req, "mtime", &mtime_ms);
 
     char rel_file[MAX_PATH_LEN];
     if (!build_rel_child(rel_dir, clean_name, rel_file, sizeof(rel_file)))
@@ -1441,6 +1494,7 @@ static esp_err_t http_fs_upload_raw(httpd_req_t *req)
         send_json_error(req, "500 Internal Server Error", "{\"error\":\"RENAME_FAIL\"}");
         goto cleanup;
     }
+    apply_mtime_if_needed(full_path, mtime_ms);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     upload_ok = true;
