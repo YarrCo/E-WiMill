@@ -33,3 +33,4 @@ esp_err_t msc_detach(void);
 bool msc_is_host_connected(void);
 void msc_stats_get(msc_stats_t *out_stats);
 void msc_stats_reset(void);
+void msc_stats_interval_get_and_reset(msc_stats_t *out_stats);

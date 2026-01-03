@@ -83,43 +83,55 @@ static bool s_usb_enabled = false;
 static msc_state_t s_state = MSC_STATE_USB_DETACHED;
 static sector_cache_t s_cache = {0};
 static msc_stats_t s_stats = {0};
+static msc_stats_t s_stats_interval = {0};
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static esp_err_t flush_cache_locked(void);
 
+static void stats_update_io(msc_stats_t *stats, uint32_t bufsize, bool fast, bool is_read)
+{
+    if (is_read) {
+        stats->read_bytes += bufsize;
+        if (fast) {
+            stats->read_fast_calls++;
+        } else {
+            stats->read_partial_calls++;
+        }
+        if (stats->read_buf_min == 0 || bufsize < stats->read_buf_min) {
+            stats->read_buf_min = bufsize;
+        }
+        if (bufsize > stats->read_buf_max) {
+            stats->read_buf_max = bufsize;
+        }
+    } else {
+        stats->write_bytes += bufsize;
+        if (fast) {
+            stats->write_fast_calls++;
+        } else {
+            stats->write_partial_calls++;
+        }
+        if (stats->write_buf_min == 0 || bufsize < stats->write_buf_min) {
+            stats->write_buf_min = bufsize;
+        }
+        if (bufsize > stats->write_buf_max) {
+            stats->write_buf_max = bufsize;
+        }
+    }
+}
+
 static void stats_record_read(uint32_t bufsize, bool fast)
 {
     portENTER_CRITICAL(&s_stats_mux);
-    s_stats.read_bytes += bufsize;
-    if (fast) {
-        s_stats.read_fast_calls++;
-    } else {
-        s_stats.read_partial_calls++;
-    }
-    if (s_stats.read_buf_min == 0 || bufsize < s_stats.read_buf_min) {
-        s_stats.read_buf_min = bufsize;
-    }
-    if (bufsize > s_stats.read_buf_max) {
-        s_stats.read_buf_max = bufsize;
-    }
+    stats_update_io(&s_stats, bufsize, fast, true);
+    stats_update_io(&s_stats_interval, bufsize, fast, true);
     portEXIT_CRITICAL(&s_stats_mux);
 }
 
 static void stats_record_write(uint32_t bufsize, bool fast)
 {
     portENTER_CRITICAL(&s_stats_mux);
-    s_stats.write_bytes += bufsize;
-    if (fast) {
-        s_stats.write_fast_calls++;
-    } else {
-        s_stats.write_partial_calls++;
-    }
-    if (s_stats.write_buf_min == 0 || bufsize < s_stats.write_buf_min) {
-        s_stats.write_buf_min = bufsize;
-    }
-    if (bufsize > s_stats.write_buf_max) {
-        s_stats.write_buf_max = bufsize;
-    }
+    stats_update_io(&s_stats, bufsize, fast, false);
+    stats_update_io(&s_stats_interval, bufsize, fast, false);
     portEXIT_CRITICAL(&s_stats_mux);
 }
 
@@ -127,6 +139,7 @@ static void stats_record_flush(void)
 {
     portENTER_CRITICAL(&s_stats_mux);
     s_stats.cache_flushes++;
+    s_stats_interval.cache_flushes++;
     portEXIT_CRITICAL(&s_stats_mux);
 }
 
@@ -134,6 +147,7 @@ static void stats_record_miss(void)
 {
     portENTER_CRITICAL(&s_stats_mux);
     s_stats.cache_misses++;
+    s_stats_interval.cache_misses++;
     portEXIT_CRITICAL(&s_stats_mux);
 }
 
@@ -486,6 +500,18 @@ void msc_stats_reset(void)
 {
     portENTER_CRITICAL(&s_stats_mux);
     memset(&s_stats, 0, sizeof(s_stats));
+    memset(&s_stats_interval, 0, sizeof(s_stats_interval));
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+void msc_stats_interval_get_and_reset(msc_stats_t *out_stats)
+{
+    if (!out_stats) {
+        return;
+    }
+    portENTER_CRITICAL(&s_stats_mux);
+    *out_stats = s_stats_interval;
+    memset(&s_stats_interval, 0, sizeof(s_stats_interval));
     portEXIT_CRITICAL(&s_stats_mux);
 }
 

@@ -8,6 +8,7 @@
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_vfs_dev.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -33,6 +34,9 @@
 #define FILEOP_TASK_STACK 4096
 #define FILEOP_TASK_PRIO 4
 
+#define USB_STATS_TASK_STACK 3072
+#define USB_STATS_TASK_PRIO 3
+
 typedef enum {
     FILEOP_TOUCH,
     FILEOP_SDTEST,
@@ -53,8 +57,12 @@ static TaskHandle_t s_fileop_task = NULL;
 static bool s_fileop_busy = false;
 static bool s_switching = false;
 
+static TaskHandle_t s_usb_stats_task = NULL;
+static bool s_usb_stats_on = false;
+
 static void cli_task(void *arg);
 static void fileop_task(void *arg);
+static void usb_stats_task(void *arg);
 static void trim_newline(char *line);
 static int parse_args(char *line, char *argv[], size_t max_args);
 
@@ -86,6 +94,7 @@ void cli_print_help(void)
     printf("  sd freq [kHz]       - show/set SD SPI freq (20000..40000)\n");
     printf("  sd check [0|1]      - disk status check (remount)\n");
     printf("  usb status|attach|detach|stats  - manage MSC state\n");
+    printf("  usb stats on|off|reset          - MSC stats monitor\n");
 }
 
 static void print_prompt(void)
@@ -184,6 +193,18 @@ static void fileop_init(void)
     }
 }
 
+static void usb_stats_task_start(void)
+{
+    if (s_usb_stats_task) {
+        return;
+    }
+    BaseType_t created = xTaskCreate(
+        usb_stats_task, "usb_stats", USB_STATS_TASK_STACK, NULL, USB_STATS_TASK_PRIO, &s_usb_stats_task);
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create USB stats task");
+    }
+}
+
 esp_err_t cli_start(void)
 {
     static bool started = false;
@@ -222,6 +243,7 @@ esp_err_t cli_start(void)
     uart_vfs_dev_port_set_tx_line_endings(UART_NUM_0, ESP_LINE_ENDINGS_CRLF);
 
     fileop_init();
+    usb_stats_task_start();
 
     BaseType_t created = xTaskCreate(cli_task, "cli_task", CLI_STACK_SIZE, NULL, CLI_PRIORITY, NULL);
     if (created != pdPASS) {
@@ -231,6 +253,47 @@ esp_err_t cli_start(void)
 
     started = true;
     return ESP_OK;
+}
+
+static void usb_stats_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (!s_usb_stats_on) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        int64_t ts_start = esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        int64_t dt_us = esp_timer_get_time() - ts_start;
+        if (dt_us <= 0) {
+            dt_us = 1;
+        }
+
+        msc_stats_t interval = {0};
+        msc_stats_interval_get_and_reset(&interval);
+
+        uint32_t rd_calls = interval.read_fast_calls + interval.read_partial_calls;
+        uint32_t wr_calls = interval.write_fast_calls + interval.write_partial_calls;
+        uint32_t rd_kbps = (uint32_t)((interval.read_bytes * 1000000ULL / (uint64_t)dt_us) / 1024ULL);
+        uint32_t wr_kbps = (uint32_t)((interval.write_bytes * 1000000ULL / (uint64_t)dt_us) / 1024ULL);
+        uint32_t rd_avg = rd_calls ? (uint32_t)(interval.read_bytes / rd_calls) : 0;
+        uint32_t wr_avg = wr_calls ? (uint32_t)(interval.write_bytes / wr_calls) : 0;
+
+        ESP_LOGI(TAG,
+                 "MSC 1s: rd=%u KB/s wr=%u KB/s calls rd=%u wr=%u buf rd[min/avg/max]=%u/%u/%u wr[min/avg/max]=%u/%u/%u",
+                 rd_kbps,
+                 wr_kbps,
+                 rd_calls,
+                 wr_calls,
+                 interval.read_buf_min,
+                 rd_avg,
+                 interval.read_buf_max,
+                 interval.write_buf_min,
+                 wr_avg,
+                 interval.write_buf_max);
+    }
 }
 
 static void handle_ls(const char *path)
@@ -509,6 +572,17 @@ static void handle_usb(int argc, char *argv[])
         if (argc >= 3 && strcmp(argv[2], "reset") == 0) {
             msc_stats_reset();
             ESP_LOGI(TAG, "MSC stats reset");
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[2], "on") == 0) {
+            s_usb_stats_on = true;
+            msc_stats_interval_get_and_reset(&(msc_stats_t){0});
+            ESP_LOGI(TAG, "MSC stats monitor: on");
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[2], "off") == 0) {
+            s_usb_stats_on = false;
+            ESP_LOGI(TAG, "MSC stats monitor: off");
             return;
         }
         msc_stats_t stats = {0};
